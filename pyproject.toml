@@ -1,0 +1,33 @@
+[project]
+name = "tbmgr"
+version = "0.1.0"
+description = "Registry, supervisor and dashboard for long-lived TensorBoard instances"
+readme = "README.md"
+requires-python = ">=3.11"
+# Deliberately dependency-free: this runs as a systemd --user unit at boot, so it
+# must work with the system interpreter without a virtualenv or package resolve.
+dependencies = []
+
+[project.scripts]
+tbmgr = "tbmgr.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+tbmgr = ["web/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
