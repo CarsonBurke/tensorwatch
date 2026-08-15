@@ -310,15 +310,31 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 
 def _derive_name(target: Path) -> str:
-    """Name a board after the project, not the log folder.
+    """Name a board after what it watches, qualified by its repository.
 
-    ``.../parameter-golf/tb_logs`` -> ``parameter-golf``;
-    ``.../xxscreeps/samples/rl/runs`` -> ``rl``.
+    ``.../cleanrl/runs`` -> ``cleanrl`` (the logdir sits at the repo root);
+    ``.../parameter-golf/postraining/runs`` -> ``parameter-golf-postraining``;
+    ``.../xxscreeps/samples/rl/runs`` -> ``xxscreeps-rl``.
+
+    A bare leaf like ``postraining`` or ``rl`` says nothing on its own, so a
+    logdir nested inside a repository carries the repository name too.
     """
     parts = list(target.parts)
     while len(parts) > 1 and _is_run_container(parts[-1]):
         parts.pop()
-    return _slug(parts[-1])
+    leaf = Path(*parts) if parts else target
+    repo = _repo_root(leaf)
+    if repo is not None and repo != leaf:
+        return _slug(f"{repo.name}-{leaf.name}")
+    return _slug(leaf.name)
+
+
+def _repo_root(path: Path) -> Path | None:
+    """Nearest ancestor (or ``path`` itself) that is a git repository."""
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
 
 
 def _unique_name(target: Path, is_taken) -> str:

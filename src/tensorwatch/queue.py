@@ -39,9 +39,8 @@ MID_FRAME_TIMEOUT = 30.0
 #: A job is attributed to a board when the board's logdir sits at most this many
 #: levels below the job's working directory...
 MAX_BOARD_DEPTH = 3
-#: ...and no more than this many boards match, so a job launched from a directory
-#: full of projects (a repo root, $HOME) is attributed to none of them.
-MAX_BOARD_MATCHES = 2
+#: ...when falling back to the working directory, and then only if it leaves a
+#: single candidate: a repo with several watched logdirs cannot say which is moving.
 
 
 def socket_path() -> Path:
@@ -130,31 +129,68 @@ def _ms(value: Any) -> float | None:
     return value / 1000.0 if isinstance(value, (int, float)) and value else None
 
 
-def _boards_for(cwd: str, board_dirs: Mapping[str, Path]) -> tuple[str, ...]:
-    """Boards whose logdir belongs to the job's working directory.
+def _boards_for(
+    cwd: str, args: Sequence[str], board_dirs: Mapping[str, Path]
+) -> tuple[str, ...]:
+    """Boards this job actually writes to.
 
-    A job's cwd is wherever ``mlq submit`` ran, so it can be a project directory
-    (one or two boards - attribute both) or a directory full of projects such as a
-    repository root or ``$HOME`` (attribute none: "everything" is not a signal).
+    The command line is the strong signal: a run that passes ``--run-dir
+    runs/vapo`` or ``--output samples/rl/runs/x`` names its own logdir, so only
+    the board watching that path is marked.  A job's cwd is merely where ``mlq
+    submit`` ran - a repository holding several watched logdirs (``tb_logs`` and
+    ``pretraining/runs`` and ``postraining/runs``) says nothing about which one is
+    moving - so cwd containment is used only when it leaves exactly one candidate.
     """
     if not cwd:
         return ()
     root = _resolved(Path(cwd))
-    matches: list[tuple[int, str]] = []
-    for name, logdir in board_dirs.items():
-        target = _resolved(logdir)
-        try:
-            if target != root and not target.is_relative_to(root):
-                continue
-        except (ValueError, OSError):
+    resolved = {name: _resolved(logdir) for name, logdir in board_dirs.items()}
+
+    referenced = _referenced_paths(root, args)
+    named = [
+        name
+        for name, logdir in resolved.items()
+        if any(_touches(candidate, logdir) for candidate in referenced)
+    ]
+    if named:
+        return tuple(named)
+
+    inside = [
+        name
+        for name, logdir in resolved.items()
+        if _within(logdir, root, MAX_BOARD_DEPTH)
+    ]
+    # Ambiguous (or absurdly broad, e.g. $HOME) means "no board", not "the first".
+    return tuple(inside) if len(inside) == 1 else ()
+
+
+def _referenced_paths(root: Path, args: Sequence[str]) -> list[Path]:
+    """Path-looking arguments, resolved against the job's working directory."""
+    found: list[Path] = []
+    for token in args:
+        value = token.split("=", 1)[1] if token.startswith("-") and "=" in token else token
+        if value.startswith("-") or "/" not in value:
             continue
-        depth = len(target.parts) - len(root.parts)
-        if depth <= MAX_BOARD_DEPTH:
-            matches.append((depth, name))
-    if len(matches) > MAX_BOARD_MATCHES:
-        return ()
-    matches.sort()
-    return tuple(name for _, name in matches)
+        candidate = Path(value)
+        found.append(_resolved(candidate if candidate.is_absolute() else root / candidate))
+    return found
+
+
+def _touches(candidate: Path, logdir: Path) -> bool:
+    """True when a referenced path is the logdir, inside it, or contains it."""
+    try:
+        return candidate == logdir or candidate.is_relative_to(logdir) or logdir.is_relative_to(candidate)
+    except (ValueError, OSError):
+        return False
+
+
+def _within(logdir: Path, root: Path, max_depth: int) -> bool:
+    try:
+        if logdir != root and not logdir.is_relative_to(root):
+            return False
+    except (ValueError, OSError):
+        return False
+    return len(logdir.parts) - len(root.parts) <= max_depth
 
 
 def _resolved(path: Path) -> Path:
@@ -176,7 +212,8 @@ def parse(view: Mapping[str, Any], board_dirs: Mapping[str, Path]) -> QueueSnaps
         cwd = str(raw.get("cwd") or "")
         attempt_count = raw.get("attemptCount")
         max_attempts = raw.get("maxAttempts")
-        boards = _boards_for(cwd, board_dirs)
+        args = [str(token) for token in (raw.get("args") or ())]
+        boards = _boards_for(cwd, args, board_dirs)
         job = QueueJob(
             id=int(raw.get("id") or 0),
             name=str(raw.get("name") or "?"),

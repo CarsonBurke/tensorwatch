@@ -21,6 +21,7 @@ STATUS_VIEW = {
             "state": "running",
             "priority": 1000,
             "cwd": "/repos/xxscreeps",
+            "args": ["python", "-m", "agent", "--output", "samples/rl/runs/corpora"],
             "maxAttempts": 1,
             "attemptCount": 1,
             "timeLimitMs": 2_700_000,
@@ -34,6 +35,7 @@ STATUS_VIEW = {
             "eligibility": "protected_drain",
             "priority": 0,
             "cwd": "/repos/kraggiculture",
+            "args": ["python", "launch.py", "--run-dir", "runs/vapo"],
             "createdAt": 1_700_000_000_000,
             "updatedAt": 1_700_000_000_000,
         },
@@ -265,31 +267,63 @@ def test_one_shot_reads_the_first_frame(fake_mlqd):
     assert [job.id for job in snapshot.queued] == [2761, 2758]
 
 
-def test_ambiguous_and_distant_cwds_are_not_attributed():
-    """A job's cwd is wherever `mlq submit` ran; "everything" is not a signal."""
-    dirs = {
-        "cleanrl": Path("/repos/cleanrl/runs"),
-        "cleanrl-archive": Path("/repos/cleanrl/runs_old"),
-        "golf": Path("/repos/parameter-golf/tb_logs"),
-        "screeps": Path("/repos/xxscreeps/samples/rl/runs"),
-    }
-    # A project directory with two watched logdirs marks both: they watch the run.
-    assert queue._boards_for("/repos/cleanrl", dirs) == ("cleanrl", "cleanrl-archive")
-    # A logdir several levels down still belongs to its project.
-    assert queue._boards_for("/repos/xxscreeps", dirs) == ("screeps",)
-    # A directory full of projects belongs to none of them.
-    assert queue._boards_for("/repos", dirs) == ()
-    assert queue._boards_for("/", dirs) == ()
-    assert queue._boards_for("", dirs) == ()
-    assert queue._boards_for("/repos/unrelated", dirs) == ()
+DIRS = {
+    "cleanrl": Path("/repos/cleanrl/runs"),
+    "cleanrl-archive": Path("/repos/cleanrl/runs_old"),
+    "golf": Path("/repos/parameter-golf/tb_logs"),
+    "golf-post": Path("/repos/parameter-golf/postraining/runs"),
+    "screeps": Path("/repos/xxscreeps/samples/rl/runs"),
+}
 
 
-def test_board_is_only_set_for_a_single_match():
+def test_output_paths_in_the_command_line_decide_the_board():
+    """The run names its own logdir; that beats guessing from the cwd."""
+    # A repo with several watched logdirs: only the one the job writes to is marked.
+    assert queue._boards_for(
+        "/repos/parameter-golf", ["python", "train.py", "--logdir", "tb_logs/run7"], DIRS
+    ) == ("golf",)
+    assert queue._boards_for(
+        "/repos/parameter-golf", ["python", "post.py", "--run-dir=postraining/runs/x"], DIRS
+    ) == ("golf-post",)
+    # A run writing somewhere nobody watches marks nothing at all.
+    assert queue._boards_for(
+        "/repos/parameter-golf", ["python", "pre.py", "--out", "pretraining/runs/exp"], DIRS
+    ) == ()
+    # Absolute paths and deeper logdirs work the same way.
+    assert queue._boards_for(
+        "/repos/xxscreeps",
+        ["uv", "run", "--project", "samples/rl", "--output", "samples/rl/runs/corpora"],
+        DIRS,
+    ) == ("screeps",)
+    assert queue._boards_for(
+        "/repos/cleanrl", ["python", "x.py", "--dir", "/repos/cleanrl/runs_old/exp"], DIRS
+    ) == ("cleanrl-archive",)
+
+
+def test_cwd_is_only_a_fallback_and_only_when_unambiguous():
+    # One watched logdir in the repo: attribute it even without an explicit path.
+    assert queue._boards_for("/repos/xxscreeps", ["python", "train.py"], DIRS) == ("screeps",)
+    # Two candidates in the same repo: cannot tell, so say nothing.
+    assert queue._boards_for("/repos/cleanrl", ["python", "train.py"], DIRS) == ()
+    assert queue._boards_for("/repos/parameter-golf", ["python", "train.py"], DIRS) == ()
+    # A directory full of projects, or none at all.
+    assert queue._boards_for("/repos", ["python", "x.py"], DIRS) == ()
+    assert queue._boards_for("/", [], DIRS) == ()
+    assert queue._boards_for("", [], DIRS) == ()
+    assert queue._boards_for("/repos/unrelated", ["python", "x.py"], DIRS) == ()
+
+
+def test_a_job_writing_to_two_watched_logdirs_marks_both():
     dirs = {"a": Path("/repos/proj/runs"), "b": Path("/repos/proj/runs_old")}
-    view = {"jobs": [{"id": 1, "name": "j", "state": "running", "cwd": "/repos/proj"}]}
+    view = {
+        "jobs": [{
+            "id": 1, "name": "j", "state": "running", "cwd": "/repos/proj",
+            "args": ["python", "x.py", "--new", "runs/v2", "--compare", "runs_old/v1"],
+        }]
+    }
     job = queue.parse(view, dirs).running[0]
     assert job.boards == ("a", "b")
-    assert job.board == "a"  # deterministic: registry order decides what a click opens
+    assert job.board == "a"  # registry order decides what a click opens
 
 
 def test_symlinked_cwd_still_matches(tmp_path):
@@ -297,7 +331,7 @@ def test_symlinked_cwd_still_matches(tmp_path):
     (real / "runs").mkdir(parents=True)
     link = tmp_path / "link"
     link.symlink_to(real)
-    assert queue._boards_for(str(link), {"b": real / "runs"}) == ("b",)
+    assert queue._boards_for(str(link), ["python", "t.py"], {"b": real / "runs"}) == ("b",)
 
 
 def test_offline_keeps_the_last_jobs(fake_mlqd, monkeypatch):

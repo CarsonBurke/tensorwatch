@@ -110,6 +110,33 @@ def test_list_reports_offline_manager(tmp_path, capsys):
     assert "manager not running" in out
 
 
+def test_names_are_qualified_by_their_repository(tmp_path):
+    """A bare leaf like `postraining` says nothing; name it after its repo too."""
+    repo = tmp_path / "parameter-golf"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "tb_logs").mkdir()
+    (repo / "postraining" / "runs").mkdir(parents=True)
+    (repo / "samples" / "rl" / "runs").mkdir(parents=True)
+
+    assert cli._derive_name(repo / "tb_logs") == "parameter-golf"
+    assert cli._derive_name(repo / "postraining" / "runs") == "parameter-golf-postraining"
+    assert cli._derive_name(repo / "samples" / "rl" / "runs") == "parameter-golf-rl"
+    # Outside a repository there is nothing to qualify with.
+    plain = tmp_path / "loose" / "experiment" / "runs"
+    plain.mkdir(parents=True)
+    assert cli._derive_name(plain) == "experiment"
+
+
+def test_add_uses_the_qualified_name(tmp_path, capsys):
+    repo = tmp_path / "proj"
+    (repo / ".git").mkdir(parents=True)
+    logdir = repo / "stage2" / "runs"
+    logdir.mkdir(parents=True)
+
+    assert cli.main(["add", str(logdir)]) == 0
+    assert config.load().board("proj-stage2") is not None
+
+
 def test_scan_finds_run_roots(tmp_path):
     make_runs(
         tmp_path,

@@ -100,8 +100,12 @@ the first `visible` queued jobs with mlq's own admission reason
 (`protected_drain`, `backfill_window_open`, …), and collapses the rest behind
 `+N more`.
 
-Jobs are matched to boards by logdir containment — a job whose working directory
-contains a registered logdir belongs to that board. That gives two things:
+Jobs are matched to boards by the paths they name: a run that passes
+`--run-dir runs/vapo` or `--output samples/rl/runs/x` identifies its own logdir, so
+only the board watching that path is marked. The working directory is a fallback,
+used only when it leaves exactly one candidate — a repository holding several
+watched logdirs (`tb_logs`, `postraining/runs`) cannot say which one is moving, and
+a run writing somewhere nobody watches marks nothing. That gives two things:
 
 - the job row is tagged with the board (`▸ xxscreeps`) and clicking it opens that
   board, so the queue and the plots are one click apart;
