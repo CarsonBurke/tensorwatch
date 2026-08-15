@@ -1,4 +1,4 @@
-"""Command line interface: ``tbmgr <command>``."""
+"""Command line interface: ``tensorwatch <command>``."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import httpd, registry, service
+from . import desktop, httpd, queue, registry, service
 from .config import (
     AUTOSTART_MODES,
     Config,
@@ -59,7 +59,7 @@ def _is_run_container(name: str) -> bool:
 
 
 def _fail(message: str) -> int:
-    print(f"tbmgr: {message}", file=sys.stderr)
+    print(f"tensorwatch: {message}", file=sys.stderr)
     return 1
 
 
@@ -127,7 +127,7 @@ def open_window(url: str, app_mode: bool = True) -> str:
         if not binary:
             continue
         argv = [binary, f"--app={url}"] if app_mode else [binary, "--new-window", url]
-        argv.append("--class=tbmgr")
+        argv.append("--class=tensorwatch")
         subprocess.Popen(
             argv,
             stdout=subprocess.DEVNULL,
@@ -159,7 +159,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if probe(cfg.server.host, cfg.server.port):
         return _fail(
             f"something already listens on {cfg.server.host}:{cfg.server.port} "
-            "(another tbmgr?); stop it or change [server].port"
+            "(another tensorwatch?); stop it or change [server].port"
         )
 
     log_dir().mkdir(parents=True, exist_ok=True)
@@ -168,13 +168,33 @@ def cmd_serve(args: argparse.Namespace) -> int:
     supervisor = Supervisor(cfg)
     reload_requested = threading.Event()
     stop = threading.Event()
+    current: dict[str, Config] = {"cfg": cfg}
 
     def do_reload() -> None:
         fresh = load(path)
         registry.set_ports(path, fresh.assigned_ports)
         if fresh.assigned_ports:
             fresh = load(path)
+        if fresh.queue != current["cfg"].queue:
+            print(
+                "tensorwatch: [queue] enabled/socket changes need a service restart",
+                file=sys.stderr,
+            )
+        current["cfg"] = fresh
         supervisor.reload(fresh)
+        if subscriber is not None:
+            # Re-match the queue against the new registry instead of waiting for
+            # mlqd's next push, which for a long run can be hours away.
+            subscriber.refresh()
+
+    subscriber = None
+    if cfg.queue.enabled:
+        subscriber = queue.start(
+            Path(cfg.queue.socket).expanduser() if cfg.queue.socket else None,
+            lambda: current["cfg"].board_dirs,
+            supervisor.publish,
+        )
+        supervisor.set_queue_source(subscriber.snapshot)
 
     server = httpd.serve(supervisor, cfg.server.host, cfg.server.port, do_reload)
     supervisor.start()
@@ -186,7 +206,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     except (AttributeError, ValueError):
         pass
 
-    print(f"tbmgr serving {cfg.dashboard_url} ({len(cfg.boards)} board(s), registry {path})")
+    print(f"tensorwatch serving {cfg.dashboard_url} ({len(cfg.boards)} board(s), registry {path})")
     for spec in cfg.boards:
         print(f"  {spec.name:<20} {spec.url:<24} {spec.target}")
     if args.window:
@@ -200,12 +220,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 do_reload()
                 print("registry reloaded")
             except ConfigError as exc:
-                print(f"tbmgr: reload failed: {exc}", file=sys.stderr)
+                print(f"tensorwatch: reload failed: {exc}", file=sys.stderr)
         stop.wait(1.0)
 
-    print("tbmgr shutting down")
+    print("tensorwatch shutting down")
     server.shutdown()
     server.server_close()
+    if subscriber is not None:
+        subscriber.shutdown()
     supervisor.shutdown()
     return 0
 
@@ -390,7 +412,7 @@ def cmd_toggle(args: argparse.Namespace) -> int:
 def cmd_list(args: argparse.Namespace) -> int:
     cfg = load()
     if not cfg.boards:
-        print(f"no boards registered in {cfg.path}; try `tbmgr scan <dir> --add`")
+        print(f"no boards registered in {cfg.path}; try `tensorwatch scan <dir> --add`")
         return 0
     live = _live_state(cfg)
     states = {b["name"]: b for b in (live or {}).get("boards", [])}
@@ -408,7 +430,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         ])
     print(_table(rows, ["board", "state", "port", "policy", "rss", "cpu", "logdir"]))
     if live is None:
-        print(f"\nmanager not running at {cfg.dashboard_url} (start it with `tbmgr serve`)")
+        print(f"\nmanager not running at {cfg.dashboard_url} (start it with `tensorwatch serve`)")
     else:
         print(f"\ndashboard {cfg.dashboard_url}")
     return 0
@@ -470,6 +492,32 @@ def cmd_logs(args: argparse.Namespace) -> int:
             return 0
 
 
+def _ensure_running(cfg: Config, timeout: float = 40.0) -> bool:
+    """Start the systemd unit if the manager is not up, then wait for the port.
+
+    The desktop launcher goes through here, so clicking the icon must produce a
+    working dashboard even after the service was stopped.
+    """
+    if probe(cfg.server.host, cfg.server.port):
+        return True
+    if not service.unit_path().exists() or shutil.which("systemctl") is None:
+        print(
+            "manager not running and no systemd unit installed; run `tensorwatch install` "
+            "or `tensorwatch serve`",
+            file=sys.stderr,
+        )
+        return False
+    print("manager not running; starting tensorwatch.service")
+    subprocess.run(["systemctl", "--user", "start", "tensorwatch.service"], check=False)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if probe(cfg.server.host, cfg.server.port):
+            return True
+        time.sleep(0.4)
+    print(f"tensorwatch.service did not come up within {timeout:.0f}s", file=sys.stderr)
+    return False
+
+
 def cmd_open(args: argparse.Namespace) -> int:
     cfg = load()
     url = cfg.dashboard_url
@@ -478,8 +526,10 @@ def cmd_open(args: argparse.Namespace) -> int:
         if spec is None:
             return _fail(f"no board {args.name!r}")
         url = spec.url
-    if not probe(cfg.server.host, cfg.server.port):
-        print(f"warning: manager not running at {url}; start it with `tbmgr serve`", file=sys.stderr)
+    if not args.no_start:
+        _ensure_running(cfg)
+    elif not probe(cfg.server.host, cfg.server.port):
+        print(f"warning: manager not running at {url}", file=sys.stderr)
     print(f"opening {url} via {open_window(url, app_mode=not args.tab)}")
     return 0
 
@@ -653,18 +703,80 @@ def cmd_service(args: argparse.Namespace) -> int:
     return service.uninstall()
 
 
+def cmd_install(args: argparse.Namespace) -> int:
+    """Install everything: the boot service, the launcher entry and `tensorwatch` on PATH."""
+    status = 0
+    if not args.no_service:
+        status |= service.install(enable=True, linger=not args.no_linger)
+    for note in desktop.install():
+        print(note)
+    cfg = load()
+    print(
+        f"\n{desktop.APP_NAME} installed. Launch it from your application menu, "
+        f"or run `tensorwatch open` ({cfg.dashboard_url})."
+    )
+    return status
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    for note in desktop.uninstall():
+        print(note)
+    if not args.keep_service:
+        service.uninstall()
+    return 0
+
+
 # ---------------------------------------------------------------------- parser
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    """One-shot view of the mlq queue, straight from the mlqd socket."""
+    cfg = load()
+    path = Path(cfg.queue.socket).expanduser() if cfg.queue.socket else None
+    snapshot = queue.one_shot(path, cfg.board_dirs)
+    if args.json:
+        print(json.dumps(snapshot.to_json(), indent=2))
+        return 0 if snapshot.connected else 1
+    if not snapshot.connected:
+        return _fail(f"mlq queue unavailable: {snapshot.error}")
+
+    limit = f"/{snapshot.effective_limit}" if snapshot.effective_limit else ""
+    print(f"{snapshot.active_leases}{limit} running, {len(snapshot.queued)} queued"
+          + (" (admission blocked)" if snapshot.admission_blocked else ""))
+    rows = []
+    for job in (*snapshot.running, *snapshot.queued):
+        age = _age(job.since if job.state == "running" else job.queued_at)
+        rows.append([
+            str(job.id), job.name, job.state, age,
+            job.reason or "-", job.board or "-", job.project or "-",
+        ])
+    if rows:
+        print(_table(rows, ["job", "name", "state", "age", "reason", "board", "project"]))
+    return 0
+
+
+def _age(since: float | None) -> str:
+    if not since:
+        return "-"
+    seconds = max(0.0, time.time() - since)
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 172800:
+        return f"{seconds / 3600:.0f}h"
+    return f"{seconds / 86400:.0f}d"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="tbmgr",
+        prog="tensorwatch",
         description="Registry + supervisor + dashboard for long-lived TensorBoard instances.",
     )
     sub = parser.add_subparsers(dest="command_name", required=True)
 
     p_serve = sub.add_parser("serve", help="run the supervisor and dashboard (foreground)")
-    p_serve.add_argument("--config", help="registry path (default ~/.config/tbmgr/config.toml)")
+    p_serve.add_argument("--config", help="registry path (default ~/.config/tensorwatch/config.toml)")
     p_serve.add_argument("--port", type=int, help="override the dashboard port")
     p_serve.add_argument("--window", action="store_true", help="also open a dashboard window")
     p_serve.set_defaults(func=cmd_serve)
@@ -688,7 +800,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_rm.add_argument("name")
     p_rm.set_defaults(func=cmd_rm)
 
-    p_set = sub.add_parser("set", help="set board keys, e.g. tbmgr set cleanrl autostart=on_demand")
+    p_set = sub.add_parser("set", help="set board keys, e.g. tensorwatch set cleanrl autostart=on_demand")
     p_set.add_argument("name")
     p_set.add_argument("assignment", nargs="+")
     p_set.set_defaults(func=cmd_set)
@@ -720,7 +832,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_open = sub.add_parser("open", help="open the dashboard (or one board) in a window")
     p_open.add_argument("name", nargs="?")
     p_open.add_argument("--tab", action="store_true", help="normal browser tab instead of app window")
+    p_open.add_argument("--no-start", action="store_true",
+                        help="do not start the service when it is down")
     p_open.set_defaults(func=cmd_open)
+
+    p_queue = sub.add_parser("queue", help="show the mlq queue as tensorwatch sees it")
+    p_queue.add_argument("--json", action="store_true")
+    p_queue.set_defaults(func=cmd_queue)
 
     p_scan = sub.add_parser("scan", help="find logdirs under a directory")
     p_scan.add_argument("root")
@@ -740,6 +858,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_uninstall = sub.add_parser("uninstall-service", help="remove the systemd --user unit")
     p_uninstall.set_defaults(func=cmd_service)
+
+    p_app = sub.add_parser("install", help="install the boot service, the app launcher and `tensorwatch` on PATH")
+    p_app.add_argument("--no-service", action="store_true", help="skip the systemd unit")
+    p_app.add_argument("--no-linger", action="store_true",
+                       help="do not enable-linger (boards then start at first login)")
+    p_app.set_defaults(func=cmd_install)
+
+    p_app_rm = sub.add_parser("uninstall", help="remove the app launcher and the systemd unit")
+    p_app_rm.add_argument("--keep-service", action="store_true")
+    p_app_rm.set_defaults(func=cmd_uninstall)
 
     return parser
 

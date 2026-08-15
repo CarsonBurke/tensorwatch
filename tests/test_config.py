@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tbmgr import config
+from tensorwatch import config
 
 
 def test_parses_boards_and_applies_defaults(tmp_path):

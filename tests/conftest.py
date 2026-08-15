@@ -53,8 +53,8 @@ with socketserver.TCPServer((args.host, args.port), Handler) as server:
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     """Isolate registry + state directories."""
-    monkeypatch.setenv("TBMGR_CONFIG", str(tmp_path / "config.toml"))
-    monkeypatch.setenv("TBMGR_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("TENSORWATCH_CONFIG", str(tmp_path / "config.toml"))
+    monkeypatch.setenv("TENSORWATCH_STATE_DIR", str(tmp_path / "state"))
     return tmp_path
 
 

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TensorWatch</title>
+    <link rel="icon" href="/static/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <aside id="sidebar">
+      <header>
+        <div class="brand">
+          <img src="/static/icon.svg" alt="" width="18" height="18" />
+          <h1>TensorWatch</h1>
+          <button id="reload-config" class="ghost" title="Re-read the registry file (r)">&#8635;</button>
+        </div>
+        <div id="totals" class="totals">connecting&hellip;</div>
+        <input id="filter" type="search" placeholder="filter boards  /" autocomplete="off" spellcheck="false" />
+      </header>
+
+      <div id="boards-wrap">
+        <div class="section-head"><span>Boards</span><span id="boards-count"></span></div>
+        <nav id="boards" role="listbox" aria-label="Registered boards"></nav>
+      </div>
+
+      <section id="queue" hidden>
+        <button id="queue-head" class="section-head" aria-expanded="true" aria-controls="queue-body">
+          <span>Queue</span><span id="queue-meta"></span>
+        </button>
+        <div id="queue-body">
+          <div id="queue-jobs"></div>
+          <button id="queue-more" class="more" hidden></button>
+          <div id="queue-error" class="queue-error" hidden></div>
+        </div>
+      </section>
+    </aside>
+
+    <main id="main">
+      <section id="panes">
+        <div id="placeholder" class="pane card">
+          <h2>Nothing open</h2>
+          <p class="muted">
+            Pick a board on the left. Panes mount on first view and the least recently
+            used ones are dropped, so only a couple of TensorBoard front-ends stay
+            resident.
+          </p>
+          <ul class="keys">
+            <li><kbd>1</kbd>&ndash;<kbd>9</kbd> switch board</li>
+            <li><kbd>/</kbd> filter</li>
+            <li><kbd>w</kbd> close the open pane</li>
+            <li><kbd>d</kbd> detach into its own window</li>
+            <li><kbd>Shift</kbd>+<kbd>R</kbd> reload the pane</li>
+            <li><kbd>Enter</kbd> open the focused board</li>
+            <li><kbd>q</kbd> collapse the queue</li>
+          </ul>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="logs" aria-labelledby="logs-title">
+      <header><strong id="logs-title">logs</strong><button id="logs-close" class="ghost">close</button></header>
+      <pre id="logs-body" tabindex="0"></pre>
+    </dialog>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

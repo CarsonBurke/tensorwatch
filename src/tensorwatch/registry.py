@@ -18,8 +18,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 HEADER = """\
-# tbmgr registry - one [[board]] per TensorBoard instance.
-# Edit by hand or with `tbmgr add` / `tbmgr rm` / `tbmgr set`.
+# tensorwatch registry - one [[board]] per TensorBoard instance.
+# Edit by hand or with `tensorwatch add` / `tensorwatch rm` / `tensorwatch set`.
 #
 #   [[board]]
 #   name = "cleanrl"                 # url path + log file name

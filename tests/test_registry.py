@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tbmgr import config, registry
+from tensorwatch import config, registry
 
 SAMPLE = """\
 # my notes survive edits
@@ -171,7 +171,7 @@ def test_edit_refuses_to_persist_unparseable_text(home):
 
 
 def test_write_atomic_follows_symlinks_and_restricts_mode(home, tmp_path):
-    real = tmp_path / "dotfiles" / "tbmgr.toml"
+    real = tmp_path / "dotfiles" / "tensorwatch.toml"
     real.parent.mkdir()
     real.write_text("[server]\n", encoding="utf-8")
     link = config.config_path()

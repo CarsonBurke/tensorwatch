@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tbmgr import cli, config, service
+from tensorwatch import cli, config, service
 
 
 @pytest.fixture(autouse=True)
@@ -169,7 +169,7 @@ def test_service_unit_is_self_contained(tmp_path, monkeypatch, capsys):
 
     assert cli.main(["install-service", "--no-enable"]) == 0
     unit = service.unit_path().read_text()
-    assert "ExecStart=" in unit and "-m tbmgr serve" in unit
+    assert "ExecStart=" in unit and "-m tensorwatch serve" in unit
     assert "PYTHONPATH=" in unit
     assert "%h/.local/bin" in unit  # systemd --user PATH does not include it by default
     assert "WantedBy=default.target" in unit

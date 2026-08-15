@@ -9,9 +9,9 @@ import urllib.request
 import pytest
 
 from conftest import wait_until
-from tbmgr import httpd
-from tbmgr.config import BoardSpec, Config, ServerSpec
-from tbmgr.supervisor import Supervisor
+from tensorwatch import httpd
+from tensorwatch.config import BoardSpec, Config, ServerSpec
+from tensorwatch.supervisor import Supervisor
 
 
 @pytest.fixture
@@ -53,7 +53,7 @@ def test_serves_dashboard_and_assets(stack):
     base, _, _ = stack
     status, headers, body = fetch(f"{base}/")
     assert status == 200
-    assert b"<title>TensorBoards</title>" in body
+    assert b"<title>TensorWatch</title>" in body
     assert headers["Content-Type"].startswith("text/html")
 
     status, headers, body = fetch(f"{base}/static/app.js")
@@ -192,3 +192,26 @@ def test_healthz(stack):
     base, _, _ = stack
     _, _, body = fetch(f"{base}/healthz")
     assert json.loads(body)["ok"] is True
+
+
+def test_state_carries_the_queue_snapshot(stack):
+    """The queue rides in the same payload, so the dashboard needs one stream."""
+    base, supervisor, _ = stack
+    _, _, body = fetch(f"{base}/api/state")
+    assert json.loads(body)["queue"] is None  # no subscriber wired into this stack
+
+    from tensorwatch.queue import QueueJob, QueueSnapshot
+
+    job = QueueJob(
+        id=7, name="job", state="running", priority=0, reason="", cwd="/repos/x",
+        project="x", boards=("fake",), board="fake", since=1.0, queued_at=1.0,
+        time_limit=None, attempts="1/1",
+    )
+    supervisor.set_queue_source(
+        lambda: QueueSnapshot(connected=True, running=(job,), active_leases=1, effective_limit=1)
+    )
+    _, _, body = fetch(f"{base}/api/state")
+    payload = json.loads(body)
+    assert payload["queue"]["connected"] is True
+    assert payload["queue"]["running"][0]["board"] == "fake"
+    assert payload["server"]["queue_visible"] == 5

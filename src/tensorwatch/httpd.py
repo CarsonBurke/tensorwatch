@@ -64,7 +64,7 @@ class ControlServer(ThreadingHTTPServer):
 
 class ControlHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "tbmgr"
+    server_version = "tensorwatch"
     sys_version = ""
 
     # ------------------------------------------------------------------ helpers
@@ -253,6 +253,6 @@ def serve(
 ) -> ControlServer:
     """Start the control server on a background thread and return it."""
     server = ControlServer((host, port), supervisor, on_reload)
-    thread = threading.Thread(target=server.serve_forever, name="tbmgr-httpd", daemon=True)
+    thread = threading.Thread(target=server.serve_forever, name="tensorwatch-httpd", daemon=True)
     thread.start()
     return server

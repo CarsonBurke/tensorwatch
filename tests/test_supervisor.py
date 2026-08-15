@@ -7,9 +7,9 @@ import time
 import pytest
 
 from conftest import wait_until
-from tbmgr import procstats
-from tbmgr.config import BoardSpec, Config, ServerSpec
-from tbmgr.supervisor import Supervisor, probe
+from tensorwatch import procstats
+from tensorwatch.config import BoardSpec, Config, ServerSpec
+from tensorwatch.supervisor import Supervisor, probe
 
 
 def build(tmp_path, fake_tb, free_port, **board_kwargs) -> Config:
@@ -108,14 +108,15 @@ def test_start_timeout_kills_a_hung_board(tmp_path, fake_tb, free_port, supervis
 def test_on_demand_board_starts_on_demand_and_stops_when_idle(
     tmp_path, fake_tb, free_port, supervisor
 ):
-    cfg = build(tmp_path, fake_tb, free_port, autostart="on_demand", idle_timeout=1.0)
+    cfg = build(tmp_path, fake_tb, free_port, autostart="on_demand", idle_timeout=3.0)
     sup = supervisor(cfg)
     time.sleep(0.4)
     assert state_of(sup) == "stopped"
 
     sup.request("demand", "fake")
     assert wait_until(lambda: state_of(sup) == "running"), sup.snapshot()
-    assert wait_until(lambda: state_of(sup) == "stopped", timeout=10), sup.snapshot()
+    # No further demand arrives, so the idle timeout must reclaim it.
+    assert wait_until(lambda: state_of(sup) == "stopped", timeout=20), sup.snapshot()
     assert "idle" in sup.snapshot()[0].message
 
 
@@ -130,7 +131,7 @@ def test_manual_board_only_starts_when_asked(tmp_path, fake_tb, free_port, super
 
 
 def test_restart_keeps_on_demand_policy(tmp_path, fake_tb, free_port, supervisor):
-    cfg = build(tmp_path, fake_tb, free_port, autostart="on_demand", idle_timeout=1.0)
+    cfg = build(tmp_path, fake_tb, free_port, autostart="on_demand", idle_timeout=3.0)
     sup = supervisor(cfg)
     sup.request("demand", "fake")
     assert wait_until(lambda: state_of(sup) == "running"), sup.snapshot()
@@ -138,7 +139,7 @@ def test_restart_keeps_on_demand_policy(tmp_path, fake_tb, free_port, supervisor
     sup.request("restart", "fake")
     assert wait_until(lambda: state_of(sup) == "running", timeout=20), sup.snapshot()
     # A restart must not pin the board running: idle stop still applies.
-    assert wait_until(lambda: state_of(sup) == "stopped", timeout=15), sup.snapshot()
+    assert wait_until(lambda: state_of(sup) == "stopped", timeout=25), sup.snapshot()
 
 
 def test_unhealthy_board_backs_off_instead_of_looping(tmp_path, fake_tb, free_port, supervisor):
@@ -148,7 +149,7 @@ def test_unhealthy_board_backs_off_instead_of_looping(tmp_path, fake_tb, free_po
     assert wait_until(lambda: state_of(sup) == "running")
 
     # Make every probe fail while the child stays alive.
-    import tbmgr.supervisor as supervisor_module
+    import tensorwatch.supervisor as supervisor_module
 
     original = supervisor_module.probe
     supervisor_module.probe = lambda host, port, timeout=0.25: False

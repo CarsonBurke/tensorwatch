@@ -8,12 +8,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-UNIT_NAME = "tbmgr.service"
+UNIT_NAME = "tensorwatch.service"
 
 UNIT_TEMPLATE = """\
-# Written by `tbmgr install-service`. Edit freely; re-running overwrites it.
+# Written by `tensorwatch install-service`. Edit freely; re-running overwrites it.
 [Unit]
-Description=TensorBoard manager (registry, supervisor, dashboard)
+Description=TensorWatch (registry, supervisor, dashboard)
 After=network.target
 
 [Service]
@@ -22,7 +22,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment="PYTHONPATH={pythonpath}"
 # systemd --user starts with a minimal PATH; tensorboard usually lives in ~/.local/bin.
 Environment=PATH=%h/.local/bin:%h/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart="{python}" -m tbmgr serve
+ExecStart="{python}" -m tensorwatch serve
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5

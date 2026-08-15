@@ -1,6 +1,6 @@
-"""Configuration model for tbmgr.
+"""Configuration model for tensorwatch.
 
-The registry is a hand-editable TOML file (default ``~/.config/tbmgr/config.toml``):
+The registry is a hand-editable TOML file (default ``~/.config/tensorwatch/config.toml``):
 
     [server]
     port = 6005
@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
-APP_NAME: Final = "tbmgr"
+APP_NAME: Final = "tensorwatch"
 
 #: Board names double as URL path segments, systemd-ish log file names and CLI
 #: arguments, so keep them boring.
@@ -74,15 +74,15 @@ def _xdg(var: str, fallback: str) -> Path:
 
 
 def config_path() -> Path:
-    """Registry path; ``TBMGR_CONFIG`` wins so tests and one-offs stay isolated."""
-    override = os.environ.get("TBMGR_CONFIG")
+    """Registry path; ``TENSORWATCH_CONFIG`` wins so tests and one-offs stay isolated."""
+    override = os.environ.get("TENSORWATCH_CONFIG")
     if override:
         return Path(override).expanduser()
     return _xdg("XDG_CONFIG_HOME", ".config") / APP_NAME / "config.toml"
 
 
 def state_dir() -> Path:
-    override = os.environ.get("TBMGR_STATE_DIR")
+    override = os.environ.get("TENSORWATCH_STATE_DIR")
     if override:
         return Path(override).expanduser()
     return _xdg("XDG_STATE_HOME", ".local/state") / APP_NAME
@@ -187,13 +187,34 @@ class ServerSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class QueueSpec:
+    """mlq integration: the queue panel in the dashboard sidebar.
+
+    TensorWatch subscribes to the mlqd socket, so there is no poll interval to
+    tune: the daemon pushes a snapshot whenever the queue changes.
+    """
+
+    enabled: bool = True
+    #: Override for mlqd's socket; empty means the standard mlqueue location.
+    socket: str = ""
+    #: Queued jobs shown before the panel collapses the rest behind "+N more".
+    visible: int = 5
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     server: ServerSpec
     boards: tuple[BoardSpec, ...]
     path: Path
+    queue: QueueSpec = field(default_factory=QueueSpec)
     #: Boards whose port was auto-assigned during load; the CLI persists these so
     #: ports never move on the next start.
     assigned_ports: Mapping[str, int] = field(default_factory=dict)
+
+    @property
+    def board_dirs(self) -> dict[str, Path]:
+        """Board name -> logdir, for matching queue jobs to boards."""
+        return {spec.name: spec.logdir for spec in self.boards if spec.logdir is not None}
 
     def board(self, name: str) -> BoardSpec | None:
         for spec in self.boards:
@@ -344,6 +365,16 @@ def _board_from(
     return spec
 
 
+def _queue_from(raw: Mapping[str, Any]) -> QueueSpec:
+    reader = _Reader(raw, "queue")
+    reader.unknown(("enabled", "socket", "visible"))
+    return QueueSpec(
+        enabled=reader.bool_("enabled", True),
+        socket=reader.str_("socket", "") or "",
+        visible=max(1, reader.int_("visible", 5) or 5),
+    )
+
+
 def _server_from(raw: Mapping[str, Any]) -> ServerSpec:
     reader = _Reader(raw, "server")
     reader.unknown(("host", "port", "port_base", "keep_warm", "start_stagger",
@@ -386,11 +417,12 @@ def parse(text: str, path: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path or '<config>'}: {exc}") from exc
 
-    unknown = sorted(set(data) - {"server", "defaults", "board"})
+    unknown = sorted(set(data) - {"server", "defaults", "board", "queue"})
     if unknown:
         raise ConfigError(f"unknown top-level table(s): {', '.join(unknown)}")
 
     server = _server_from(data.get("server") or {})
+    queue = _queue_from(data.get("queue") or {})
     defaults = data.get("defaults") or {}
     _Reader(defaults, "defaults").unknown(_DEFAULT_KEYS)
 
@@ -429,6 +461,7 @@ def parse(text: str, path: Path | None = None) -> Config:
         server=server,
         boards=tuple(resolved),
         path=path or config_path(),
+        queue=queue,
         assigned_ports=assigned,
     )
 

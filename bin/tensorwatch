@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Run tbmgr straight from the checkout, no install or virtualenv required.
+# Run tensorwatch straight from the checkout, no install or virtualenv required.
 set -euo pipefail
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}"
-exec "${TBMGR_PYTHON:-python3}" -m tbmgr "$@"
+exec "${TENSORWATCH_PYTHON:-python3}" -m tensorwatch "$@"

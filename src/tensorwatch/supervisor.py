@@ -24,7 +24,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal
 
 from .config import BoardSpec, Config, log_dir
 from . import procstats
@@ -124,8 +124,11 @@ def probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> bool:
 class Supervisor:
     """Owns the child processes for every enabled board."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, queue_source: Callable[[], Any] | None = None) -> None:
         self._config = config
+        #: Optional callable returning the current mlq queue snapshot; it rides
+        #: along in the same state payload so the dashboard needs one stream.
+        self._queue_source = queue_source
         self._boards: dict[str, _Runtime] = {}
         self._order: list[str] = []
         self._requests: queue.Queue[tuple[Action, str]] = queue.Queue()
@@ -133,13 +136,36 @@ class Supervisor:
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stopping = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="tbmgr-supervisor", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="tensorwatch-supervisor", daemon=True
+        )
         self._last_spawn = 0.0
         self._last_stats = 0.0
         self._last_publish = 0.0
         self._pending_config: Config | None = None
         self._snapshot: tuple[BoardStatus, ...] = ()
         self._apply_config(config)
+
+    def set_queue_source(self, source: Callable[[], Any] | None) -> None:
+        self._queue_source = source
+
+    @property
+    def watchers(self) -> int:
+        """Number of connected dashboards (SSE subscribers)."""
+        with self._lock:
+            return len(self._subscribers)
+
+    def publish(self) -> None:
+        """Push a state frame without touching child state.
+
+        Called from the queue poller thread, so it only re-encodes the snapshot
+        the supervisor thread already built.
+        """
+        with self._lock:
+            payload = self._encode(self._snapshot)
+            subscribers = list(self._subscribers)
+            self._last_publish = time.time()
+        self._broadcast(payload, subscribers)
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -312,6 +338,10 @@ class Supervisor:
         if spec.autostart == "always":
             return True
         if spec.autostart == "on_demand":
+            if runtime.state is State.starting:
+                # A board that is still scanning its logdir must not be killed
+                # because the demand aged out while it warmed up.
+                return True
             return bool(runtime.last_demand) and (now - runtime.last_demand) < spec.idle_timeout
         return False
 
@@ -411,7 +441,7 @@ class Supervisor:
         except (KeyError, OSError):
             return ""
         for line in reversed(lines):
-            if not line.startswith("--- tbmgr"):
+            if not line.startswith("--- tensorwatch"):
                 return line[:200]
         return ""
 
@@ -435,7 +465,7 @@ class Supervisor:
         log = self._open_log(spec)
         argv = spec.argv()
         log.write(
-            f"\n--- tbmgr {time.strftime('%F %T')} start: {' '.join(argv)}\n".encode()
+            f"\n--- tensorwatch {time.strftime('%F %T')} start: {' '.join(argv)}\n".encode()
         )
         log.flush()
         try:
@@ -449,7 +479,7 @@ class Supervisor:
                 start_new_session=True,
             )
         except OSError as exc:
-            log.write(f"--- tbmgr spawn failed: {exc}\n".encode())
+            log.write(f"--- tensorwatch spawn failed: {exc}\n".encode())
             log.close()
             runtime.state = State.failed
             runtime.message = f"cannot start {spec.command[0]!r}: {exc.strerror or exc}"
@@ -501,7 +531,7 @@ class Supervisor:
                     archive.write(tail)
                 os.truncate(runtime.log.fileno(), 0)
                 runtime.log.write(
-                    f"--- tbmgr {time.strftime('%F %T')} rotated; tail kept in {previous}\n".encode()
+                    f"--- tensorwatch {time.strftime('%F %T')} rotated; tail kept in {previous}\n".encode()
                 )
             except OSError:
                 continue
@@ -597,6 +627,7 @@ class Supervisor:
         )
 
     def _refresh_snapshot(self, force: bool = False) -> None:
+        """Rebuild the board snapshot (supervisor thread only) and publish it."""
         now = time.time()
         fresh = tuple(
             self._status(self._boards[name], now) for name in self._order if name in self._boards
@@ -615,6 +646,10 @@ class Supervisor:
             self._last_publish = now
             payload = self._encode(fresh)
             subscribers = list(self._subscribers)
+        self._broadcast(payload, subscribers)
+
+    @staticmethod
+    def _broadcast(payload: str, subscribers: Iterable[queue.Queue[str]]) -> None:
         for channel in subscribers:
             try:
                 channel.put_nowait(payload)
@@ -630,13 +665,16 @@ class Supervisor:
 
     def _encode(self, statuses: tuple[BoardStatus, ...]) -> str:
         server = self._config.server
+        snapshot = self._queue_source() if self._queue_source is not None else None
         return json.dumps(
             {
                 "boards": [status.to_json() for status in statuses],
+                "queue": snapshot.to_json() if snapshot is not None else None,
                 "server": {
                     "keep_warm": server.keep_warm,
                     "port": server.port,
                     "config_path": str(self._config.path),
+                    "queue_visible": self._config.queue.visible,
                 },
                 "now": time.time(),
             },

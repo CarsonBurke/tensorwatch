@@ -1,5 +1,5 @@
 [project]
-name = "tbmgr"
+name = "tensorwatch"
 version = "0.1.0"
 description = "Registry, supervisor and dashboard for long-lived TensorBoard instances"
 readme = "README.md"
@@ -9,7 +9,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.scripts]
-tbmgr = "tbmgr.cli:main"
+tensorwatch = "tensorwatch.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -22,7 +22,7 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-tbmgr = ["web/*"]
+tensorwatch = ["web/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
