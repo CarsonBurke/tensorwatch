@@ -36,8 +36,9 @@ def test_parses_boards_and_applies_defaults(tmp_path):
     assert first.reload_interval == 120.0
     # Name falls back to the logdir basename, port to the next free slot.
     assert (second.name, second.autostart) == ("tb_logs", "always")
-    assert second.port == 6200
-    assert cfg.assigned_ports == {"tb_logs": 6200}
+    # Allocation is monotonic (above cleanrl's 6201), never recycling ports.
+    assert second.port == 6202
+    assert cfg.assigned_ports == {"tb_logs": 6202}
     assert cfg.board("cleanrl") is first
 
 
@@ -97,8 +98,23 @@ def test_auto_ports_skip_taken_and_unsafe(tmp_path):
     text = text.replace('name = "c"', 'name = "c"\nlogdir = "/tmp"')
     cfg = config.parse(text)
     ports = [board.port for board in cfg.boards]
-    # 5999 is free, 6000 is browser-blocked, 6001 is claimed, 6010 is the server.
-    assert ports == [5999, 6001, 6002]
+    # Allocation is monotonic: above every port in use (6001 claimed, 6010 server).
+    assert ports == [6011, 6001, 6012]
+
+
+def test_ports_are_never_recycled():
+    """A freed port must not be handed to another logdir.
+
+    TensorBoard keeps pins and settings per origin, so reusing a port would give
+    the new board the old board's saved UI state.
+    """
+    base = config.DEFAULT_PORT_BASE
+    # Board on base+1 was removed; the gap must stay a gap.
+    assert config.next_free_port(base, {base, base + 2, 6005}) == base + 3
+    # Browser-blocked ports are still skipped.
+    assert config.next_free_port(6000, {5999}) == 6001
+    # An empty registry starts at the base.
+    assert config.next_free_port(base, {6005}) == base
 
 
 @pytest.mark.parametrize(

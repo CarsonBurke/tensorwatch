@@ -387,6 +387,12 @@ def cmd_set(args: argparse.Namespace) -> int:
         return _fail(str(exc))
     for key, value in updates:
         print(f"{args.name}.{key} = {value!r}")
+        if key == "port":
+            print(
+                "  note: TensorBoard keeps pins and settings per origin, so this "
+                "board's saved UI state stays with its old port",
+                file=sys.stderr,
+            )
     if _notify_reload(cfg):
         print("running manager reloaded")
     return 0

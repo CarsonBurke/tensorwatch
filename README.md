@@ -68,7 +68,13 @@ other than `tensorboard`, e.g. `["uv", "run", "--project", "/repo", "tensorboard
 
 Ports are part of the contract — the dashboard links straight at them — so an
 auto-assigned port is written back into the registry the first time it is used and
-never moves afterwards.
+never moves afterwards, including across reboots.
+
+That matters beyond bookmarks: TensorBoard keeps pinned cards, smoothing and the
+rest of its UI state in browser storage keyed by origin, i.e. by port. So
+allocation is monotonic — a removed board's port is never handed to another logdir
+— and changing a board's `port` by hand (or with `set`) leaves its saved
+TensorBoard state behind on the old one.
 
 Edits made by `add/rm/set/enable/disable/scan` are line-level: comments, ordering
 and formatting survive, and an edit that would not parse is rejected before

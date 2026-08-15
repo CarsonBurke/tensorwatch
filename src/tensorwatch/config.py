@@ -402,7 +402,14 @@ def _server_from(raw: Mapping[str, Any]) -> ServerSpec:
 
 
 def next_free_port(base: int, taken: set[int]) -> int:
-    port = base
+    """Allocate the next board port *above* everything already in use.
+
+    Monotonic on purpose: TensorBoard keeps pins, smoothing and other UI settings
+    in browser storage keyed by origin, i.e. by port.  Handing a freed port to a
+    different logdir would silently give the new board another project's saved
+    state, so ports are never recycled while any board still sits above them.
+    """
+    port = max([base, *(value + 1 for value in taken if value >= base)])
     while port in taken or port in UNSAFE_PORTS:
         port += 1
         if port > 65535:
