@@ -113,6 +113,10 @@ Changing a board's port by hand leaves its saved UI on the old one.
 `1`–`9` switch board, `/` filter, `w` close the open pane, `d` detach it,
 `Shift`+`R` reload it, `q` collapse the queue, `r` reload the registry.
 
+A row marked `▶ 12s` is receiving data: that is the newest `events.out.tfevents*`
+write under its logdir, so it counts any run under `runs/` no matter who started
+it. `○2` counts mlq jobs still queued for that board.
+
 The dashboard only keeps a few TensorBoard UIs mounted (`keep_warm`, default
 2). The processes themselves follow each board's autostart policy.
 
@@ -121,4 +125,8 @@ The dashboard only keeps a few TensorBoard UIs mounted (`keep_warm`, default
 - Loopback only. A non-loopback `host` or `--bind_all` is rejected unless
   `[server] allow_remote = true`. TensorBoard has no auth.
 - State and logs: `~/.local/state/tensorwatch/`.
+- TensorBoard opens one file per event file, so the service sets
+  `LimitNOFILE=65536`. With the usual 1024 a board with thousands of runs loads
+  nothing and says "No dashboards are active for the current data set";
+  `doctor` flags that.
 - Tests: `python3 -m pytest tests -q`.
