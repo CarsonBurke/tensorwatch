@@ -947,6 +947,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except BrokenPipeError:
+        # `tensorwatch list | head` closes the pipe: exit quietly, but keep
+        # SIGPIPE ignored - the serve command is a long-lived HTTP server and
+        # SIG_DFL would let a disconnecting client kill it.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 128 + 13
     except ConfigError as exc:
         return _fail(str(exc))
     except registry.RegistryError as exc:
