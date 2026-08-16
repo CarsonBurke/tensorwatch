@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import AbstractSet, Any, Callable, Mapping, Sequence
 
 #: Must match ``PROTOCOL_VERSION`` in mlqueue/src/protocol.rs.
 PROTOCOL_VERSION = 8
@@ -130,7 +130,10 @@ def _ms(value: Any) -> float | None:
 
 
 def _boards_for(
-    cwd: str, args: Sequence[str], board_dirs: Mapping[str, Path]
+    cwd: str,
+    args: Sequence[str],
+    board_dirs: Mapping[str, Path],
+    writing: AbstractSet[str] = frozenset(),
 ) -> tuple[str, ...]:
     """Boards this job actually writes to.
 
@@ -160,8 +163,16 @@ def _boards_for(
         for name, logdir in resolved.items()
         if _within(logdir, root, MAX_BOARD_DEPTH)
     ]
-    # Ambiguous (or absurdly broad, e.g. $HOME) means "no board", not "the first".
-    return tuple(inside) if len(inside) == 1 else ()
+    if len(inside) == 1:
+        return tuple(inside)
+    # Several candidates in one repository (a live logdir and an archive, say): the
+    # one actually receiving data is the run's. Frameworks like CleanRL name their
+    # run directory themselves, so this is the common case.
+    live = [name for name in inside if name in writing]
+    if len(live) == 1:
+        return tuple(live)
+    # Still ambiguous, or absurdly broad ($HOME): no board, rather than the first.
+    return ()
 
 
 def _referenced_paths(root: Path, args: Sequence[str]) -> list[Path]:
@@ -201,7 +212,11 @@ def _resolved(path: Path) -> Path:
         return path
 
 
-def parse(view: Mapping[str, Any], board_dirs: Mapping[str, Path]) -> QueueSnapshot:
+def parse(
+    view: Mapping[str, Any],
+    board_dirs: Mapping[str, Path],
+    writing: AbstractSet[str] = frozenset(),
+) -> QueueSnapshot:
     """Turn an mlq ``status`` view into a snapshot."""
     running: list[QueueJob] = []
     queued: list[QueueJob] = []
@@ -213,7 +228,7 @@ def parse(view: Mapping[str, Any], board_dirs: Mapping[str, Path]) -> QueueSnaps
         attempt_count = raw.get("attemptCount")
         max_attempts = raw.get("maxAttempts")
         args = [str(token) for token in (raw.get("args") or ())]
-        boards = _boards_for(cwd, args, board_dirs)
+        boards = _boards_for(cwd, args, board_dirs, writing)
         job = QueueJob(
             id=int(raw.get("id") or 0),
             name=str(raw.get("name") or "?"),
@@ -335,10 +350,13 @@ class QueueSubscriber(threading.Thread):
         path: Path,
         board_dirs: Callable[[], Mapping[str, Path]],
         on_change: Callable[[], None] | None = None,
+        writing: Callable[[], AbstractSet[str]] | None = None,
     ) -> None:
         super().__init__(name="tensorwatch-queue", daemon=True)
         self._path = path
         self._board_dirs = board_dirs
+        #: Boards currently receiving data; breaks attribution ties.
+        self._writing = writing or (lambda: frozenset())
         self._on_change = on_change
         self._snapshot = QueueSnapshot()
         #: Last view received, kept so a registry reload can re-match boards
@@ -407,7 +425,7 @@ class QueueSubscriber(threading.Thread):
         self._sock = None
 
     def _absorb(self, view: Mapping[str, Any]) -> None:
-        fresh = parse(view, self._board_dirs())
+        fresh = parse(view, self._board_dirs(), self._writing())
         with self._lock:
             changed = fresh.signature != self._snapshot.signature
             self._snapshot = fresh
@@ -431,9 +449,10 @@ def start(
     path: Path | None,
     board_dirs: Callable[[], Mapping[str, Path]],
     on_change: Callable[[], None] | None = None,
+    writing: Callable[[], AbstractSet[str]] | None = None,
 ) -> QueueSubscriber:
     """Start a subscriber thread; it reconnects on its own if mlqd is absent."""
-    subscriber = QueueSubscriber(path or socket_path(), board_dirs, on_change)
+    subscriber = QueueSubscriber(path or socket_path(), board_dirs, on_change, writing)
     subscriber.start()
     return subscriber
 

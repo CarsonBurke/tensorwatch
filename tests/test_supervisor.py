@@ -226,3 +226,24 @@ def test_procstats_sees_our_own_group():
     assert sample[os.getpgrp()].rss_bytes > 0
     assert sample[os.getpgrp()].processes >= 1
     assert procstats.sample([]) == {}
+
+
+def test_raise_file_limit_lifts_the_soft_limit(monkeypatch):
+    """A board needs one descriptor per event file; the usual 1024 is not enough."""
+    import resource
+
+    from tensorwatch.supervisor import raise_file_limit
+
+    limits = {"value": (1024, 1_048_576)}
+    monkeypatch.setattr(resource, "getrlimit", lambda which: limits["value"])
+    monkeypatch.setattr(
+        resource, "setrlimit", lambda which, pair: limits.__setitem__("value", pair)
+    )
+
+    assert raise_file_limit(65536) == (65536, 1_048_576)
+    assert limits["value"] == (65536, 1_048_576)
+
+    limits["value"] = (2048, 4096)
+    assert raise_file_limit(65536) == (4096, 4096)  # never above the hard limit
+    limits["value"] = (131072, 1_048_576)
+    assert raise_file_limit(65536) == (131072, 1_048_576)  # never lowered

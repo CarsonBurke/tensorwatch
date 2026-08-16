@@ -335,21 +335,34 @@ function activityByBoard() {
 /**
  * Compact "is work happening here" mark for a board row.
  *
- * One running job shows its elapsed time, several show a count; queued work is a
- * dimmer count. Details go in the tooltip so the row stays one line.
+ * Ground truth first: `writing` means something is appending to this logdir right
+ * now, whoever started it and whichever child run it writes to. mlq only adds the
+ * job names, and a queued count in its own dim slot. Details go in the tooltip so
+ * the row stays one line.
  */
-function runMark(work, live) {
-  if (!work) return { text: "", queued: "", title: "" };
-  const { running, queued } = work;
+function runMark(board, work, live) {
+  const running = work ? work.running : [];
+  const queued = work ? work.queued : [];
   let text = "";
-  // Without a live subscription the elapsed time would be a guess, so show the
-  // fact of the run and say "last known" in the tooltip.
-  if (running.length === 1) text = live ? `▶ ${fmtAge(running[0].since)}` : "▶ –";
-  else if (running.length > 1) text = `▶ ${running.length}`;
-  // Queued work is not running work: its own dim slot, with the panel's glyph.
+  if (board.writing) {
+    text = `▶ ${fmtAge(board.last_event)}`;
+  } else if (running.length === 1) {
+    // A job is running but no data has landed yet (or it stopped landing).
+    text = live ? `▶ ${fmtAge(running[0].since)}` : "▶ –";
+  } else if (running.length > 1) {
+    text = `▶ ${running.length}`;
+  }
   const queuedText = queued.length ? `○${queued.length}` : "";
 
-  const lines = live ? [] : ["mlq offline — last known:"];
+  const lines = [];
+  if (board.last_event) {
+    lines.push(
+      board.writing
+        ? `receiving data — last event ${fmtAge(board.last_event)} ago`
+        : `quiet — last event ${fmtAge(board.last_event)} ago`,
+    );
+  }
+  if (!live && (running.length || queued.length)) lines.push("mlq offline — last known:");
   for (const job of running) lines.push(`mlq #${job.id} ${job.name} — running ${fmtAge(job.since)}`);
   for (const job of queued) {
     lines.push(`mlq #${job.id} ${job.name} — queued${job.reason ? ` (${job.reason})` : ""}`);
@@ -389,10 +402,11 @@ function renderBoards() {
     // Hotkeys count what is on screen, so a hidden board is never selectable.
     const number = filtered ? 0 : ++shown;
     const work = activity.get(board.name);
-    const mark = runMark(work, live);
+    const mark = runMark(board, work, live);
     const key = [
       board.state, board.target, board.message, meta, board.name === active,
       frames.has(board.name), index, number, filtered, mark.text, mark.queued, mark.title, live,
+      board.writing,
     ].join("|");
     if (row.key === key) return;
     row.key = key;
@@ -407,7 +421,7 @@ function renderBoards() {
       `board state-${board.state}` +
       (board.name === active ? " active" : "") +
       (frames.has(board.name) ? " mounted" : "") +
-      (work && work.running.length && live ? " training" : "") +
+      (board.writing ? " training" : "") +
       (filtered ? " hidden" : "");
     row.el.title =
       `${board.target}\n${board.message || board.state}` + (mark.title ? `\n${mark.title}` : "");

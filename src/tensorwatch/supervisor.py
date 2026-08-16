@@ -16,6 +16,7 @@ import errno
 import json
 import os
 import queue
+import resource
 import signal
 import socket
 import subprocess
@@ -24,10 +25,10 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Mapping
 
 from .config import BoardSpec, Config, log_dir
-from . import procstats
+from . import activity, procstats
 
 #: Log files are truncated-by-rotation at this size; TensorBoard is chatty on
 #: reload errors and these logs live forever under a systemd unit.
@@ -42,6 +43,8 @@ MAX_BACKOFF = 60.0
 #: A board that stayed up this long is considered healthy again (backoff reset).
 STABLE_AFTER = 300.0
 PROBE_TIMEOUT = 0.25
+#: Descriptors a board may need: one per event file, plus headroom.
+WANTED_NOFILE = 65536
 TERM_GRACE = 10.0
 
 Action = Literal["start", "stop", "restart", "demand"]
@@ -78,6 +81,9 @@ class BoardStatus:
     cpu_percent: float | None
     idle_timeout: float
     demanded_ago: float | None
+    #: Newest event-file write under the logdir, and whether that counts as live.
+    last_event: float | None
+    writing: bool
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -111,6 +117,25 @@ class _Runtime:
         return self.proc.pid if self.proc and self.proc.poll() is None else None
 
 
+def raise_file_limit(target: int = WANTED_NOFILE) -> tuple[int, int]:
+    """Lift this process's file-descriptor soft limit; children inherit it.
+
+    TensorBoard's data server keeps one descriptor per event file, so a logdir
+    with a few thousand runs exhausts the usual soft limit of 1024 and the board
+    silently serves nothing ("No dashboards are active for the current data set").
+    Returns the (soft, hard) limit in force afterwards.
+    """
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = min(target, hard) if hard != resource.RLIM_INFINITY else target
+    if soft != resource.RLIM_INFINITY and soft < wanted:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+        except (ValueError, OSError):
+            return soft, hard
+        return wanted, hard
+    return soft, hard
+
+
 def probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> bool:
     """True when something accepts TCP on the board's port."""
     target = "127.0.0.1" if host in ("0.0.0.0", "::") else host
@@ -124,8 +149,16 @@ def probe(host: str, port: int, timeout: float = PROBE_TIMEOUT) -> bool:
 class Supervisor:
     """Owns the child processes for every enabled board."""
 
-    def __init__(self, config: Config, queue_source: Callable[[], Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        queue_source: Callable[[], Any] | None = None,
+        activity_source: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> None:
         self._config = config
+        #: Optional callable returning per-board logdir activity; this is what makes
+        #: a row say "data is arriving", independent of who launched the run.
+        self._activity_source = activity_source
         #: Optional callable returning the current mlq queue snapshot; it rides
         #: along in the same state payload so the dashboard needs one stream.
         self._queue_source = queue_source
@@ -144,10 +177,14 @@ class Supervisor:
         self._last_publish = 0.0
         self._pending_config: Config | None = None
         self._snapshot: tuple[BoardStatus, ...] = ()
+        self._activity: Mapping[str, Any] = {}
         self._apply_config(config)
 
     def set_queue_source(self, source: Callable[[], Any] | None) -> None:
         self._queue_source = source
+
+    def set_activity_source(self, source: Callable[[], Mapping[str, Any]] | None) -> None:
+        self._activity_source = source
 
     @property
     def watchers(self) -> int:
@@ -605,6 +642,7 @@ class Supervisor:
 
     def _status(self, runtime: _Runtime, now: float) -> BoardStatus:
         spec = runtime.spec
+        sample = self._activity.get(spec.name)
         return BoardStatus(
             name=spec.name,
             state=runtime.state.value,
@@ -624,11 +662,14 @@ class Supervisor:
             cpu_percent=runtime.cpu_percent,
             idle_timeout=spec.idle_timeout,
             demanded_ago=(now - runtime.last_demand) if runtime.last_demand else None,
+            last_event=sample.mtime if sample is not None else None,
+            writing=activity.writing(sample, now),
         )
 
     def _refresh_snapshot(self, force: bool = False) -> None:
         """Rebuild the board snapshot (supervisor thread only) and publish it."""
         now = time.time()
+        self._activity = self._activity_source() if self._activity_source is not None else {}
         fresh = tuple(
             self._status(self._boards[name], now) for name in self._order if name in self._boards
         )
@@ -660,7 +701,8 @@ class Supervisor:
     def _significant(statuses: Iterable[BoardStatus]) -> tuple[Any, ...]:
         """Fields worth waking the browser for (resource counters are not)."""
         return tuple(
-            (s.name, s.state, s.pid, s.message, s.restarts, s.enabled, s.port) for s in statuses
+            (s.name, s.state, s.pid, s.message, s.restarts, s.enabled, s.port, s.writing)
+            for s in statuses
         )
 
     def _encode(self, statuses: tuple[BoardStatus, ...]) -> str:

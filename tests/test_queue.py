@@ -300,6 +300,18 @@ def test_output_paths_in_the_command_line_decide_the_board():
     ) == ("cleanrl-archive",)
 
 
+def test_activity_breaks_an_ambiguous_cwd():
+    """CleanRL-style runs name no logdir; the one receiving data is theirs."""
+    args = [".venv/bin/python", "cleanrl/td_jepa.py", "--exp-name", "td_jepa_v1"]
+    # cleanrl and cleanrl-archive both live under the repo: undecidable on paths.
+    assert queue._boards_for("/repos/cleanrl", args, DIRS) == ()
+    # ...but only one of them is being written to right now.
+    assert queue._boards_for("/repos/cleanrl", args, DIRS, {"cleanrl"}) == ("cleanrl",)
+    # Both writing is still ambiguous, and an unrelated board does not help.
+    assert queue._boards_for("/repos/cleanrl", args, DIRS, {"cleanrl", "cleanrl-archive"}) == ()
+    assert queue._boards_for("/repos/cleanrl", args, DIRS, {"golf"}) == ()
+
+
 def test_cwd_is_only_a_fallback_and_only_when_unambiguous():
     # One watched logdir in the repo: attribute it even without an explicit path.
     assert queue._boards_for("/repos/xxscreeps", ["python", "train.py"], DIRS) == ("screeps",)

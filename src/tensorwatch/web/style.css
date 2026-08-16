@@ -190,7 +190,7 @@ button.section-head:hover { color: var(--muted); }
 /* A board whose project has an mlq run going: its data is moving right now. */
 .board.training .run { color: var(--ok); }
 .board.training .dot { box-shadow: 0 0 0 3px rgba(91, 191, 156, 0.14); }
-/* A board that is not up is not training, whatever its project is doing. */
+/* A stopped board can still be receiving data; say so without claiming it is up. */
 .board:not(.state-running) .run { color: var(--muted); }
 .board:not(.state-running).training .dot { box-shadow: none; }
 .board .runq {

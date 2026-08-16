@@ -26,6 +26,10 @@ ExecStart="{python}" -m tensorwatch serve
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
+# TensorBoard's data server holds one descriptor per event file, and a large
+# logdir has thousands; systemd's default soft limit of 1024 makes it load
+# nothing at all ("No dashboards are active for the current data set").
+LimitNOFILE=65536
 # The manager stops its own boards on SIGTERM; systemd cleans up whatever is left.
 KillMode=mixed
 TimeoutStopSec=45

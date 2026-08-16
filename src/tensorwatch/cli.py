@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import resource
 import shutil
 import signal
 import subprocess
@@ -18,7 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import desktop, httpd, queue, registry, service
+from . import activity, desktop, httpd, queue, registry, service
 from .config import (
     AUTOSTART_MODES,
     Config,
@@ -31,7 +32,7 @@ from .config import (
     parse,
     state_dir,
 )
-from .supervisor import Supervisor, probe
+from .supervisor import Supervisor, probe, raise_file_limit
 
 #: A directory whose name *starts* with one of these tokens holds a family of runs
 #: rather than being one run: ``runs``, ``runs_old``, ``tb_logs``,
@@ -164,6 +165,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     log_dir().mkdir(parents=True, exist_ok=True)
     state_dir().mkdir(parents=True, exist_ok=True)
+    soft, _hard = raise_file_limit()
+    if soft < 4096:
+        print(
+            f"tensorwatch: warning: only {soft} file descriptors available; boards with "
+            "thousands of event files will fail to load",
+            file=sys.stderr,
+        )
 
     supervisor = Supervisor(cfg)
     reload_requested = threading.Event()
@@ -187,12 +195,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
             # mlqd's next push, which for a long run can be hours away.
             subscriber.refresh()
 
+    watcher = activity.Watcher(
+        lambda: current["cfg"].board_dirs, supervisor.publish
+    )
+    supervisor.set_activity_source(watcher.snapshot)
+    watcher.start()
+
     subscriber = None
     if cfg.queue.enabled:
         subscriber = queue.start(
             Path(cfg.queue.socket).expanduser() if cfg.queue.socket else None,
             lambda: current["cfg"].board_dirs,
             supervisor.publish,
+            lambda: {
+                name
+                for name, sample in watcher.snapshot().items()
+                if activity.writing(sample)
+            },
         )
         supervisor.set_queue_source(subscriber.snapshot)
 
@@ -228,6 +247,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     server.server_close()
     if subscriber is not None:
         subscriber.shutdown()
+    watcher.shutdown()
     supervisor.shutdown()
     return 0
 
@@ -691,6 +711,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     print(f"state        {state_dir()}")
     print(f"dashboard    {cfg.dashboard_url} "
           f"{'(running)' if probe(cfg.server.host, cfg.server.port) else '(not running)'}")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    print(f"open files   soft {soft}, hard {hard}")
     unit = service.unit_path()
     print(f"systemd unit {unit} {'(installed)' if unit.exists() else '(not installed)'}")
     if unit.exists():
@@ -701,10 +723,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         issues = []
         if binary is None or not Path(binary).exists():
             issues.append(f"command {spec.command[0]!r} not found in PATH")
+        events = 0
         if spec.logdir is not None and not spec.logdir.exists():
             issues.append("logdir missing")
-        elif spec.logdir is not None and _count_events(spec.logdir, limit=1) == 0:
-            issues.append("no event files found")
+        elif spec.logdir is not None:
+            events = _count_events(spec.logdir)
+            if events == 0:
+                issues.append("no event files found")
+        # TensorBoard's data server holds a descriptor per event file; too few and
+        # the board serves "No dashboards are active for the current data set".
+        limit = board_file_limit()
+        if events and limit < events + 256:
+            issues.append(
+                f"{events} event files but only {limit} descriptors per board; run "
+                "`tensorwatch install-service` to raise LimitNOFILE"
+            )
         if spec.exposed:
             issues.append(
                 f"reachable off this machine (host {spec.host}); TensorBoard has no auth"
@@ -717,6 +750,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"  ! {issue}")
     print("\nno problems found" if not problems else f"\n{problems} problem(s) found")
     return 1 if problems else 0
+
+
+def board_file_limit() -> int:
+    """Descriptors a board process gets with the current configuration."""
+    if service.unit_path().exists() and shutil.which("systemctl") is not None:
+        shown = subprocess.run(
+            ["systemctl", "--user", "show", "tensorwatch.service", "-p", "LimitNOFILESoft",
+             "--value"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.strip()
+        if shown.isdigit():
+            return int(shown)
+    return resource.getrlimit(resource.RLIMIT_NOFILE)[0]
 
 
 def cmd_service(args: argparse.Namespace) -> int:

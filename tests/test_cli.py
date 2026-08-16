@@ -201,6 +201,8 @@ def test_service_unit_is_self_contained(tmp_path, monkeypatch, capsys):
     assert "%h/.local/bin" in unit  # systemd --user PATH does not include it by default
     assert "WantedBy=default.target" in unit
     assert "KillMode=mixed" in unit
+    # A large logdir needs one descriptor per event file; systemd defaults to 1024.
+    assert "LimitNOFILE=65536" in unit
 
     assert cli.main(["uninstall-service"]) == 0
     assert not service.unit_path().exists()
