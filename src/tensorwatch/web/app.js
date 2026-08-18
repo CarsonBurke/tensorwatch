@@ -426,7 +426,7 @@ function renderBoards() {
     row.el.title =
       `${board.target}\n${board.message || board.state}` + (mark.title ? `\n${mark.title}` : "");
     row.el.setAttribute("aria-selected", board.name === active ? "true" : "false");
-    row.idx.textContent = number && number < 10 ? String(number) : "";
+    row.idx.textContent = number && number <= 10 ? (number === 10 ? "0" : String(number)) : "";
     row.power.textContent = running ? "■" : "▶";
     row.power.title = running ? "stop" : "start";
     // Keep DOM order in sync with registry order without rebuilding rows.
@@ -743,12 +743,20 @@ document.addEventListener("visibilitychange", () => {
 });
 
 document.addEventListener("keydown", (event) => {
+  if (els.logs.open) return;  // the modal owns the keyboard
+  if (event.ctrlKey && !event.metaKey && !event.altKey && event.key >= "0" && event.key <= "9") {
+    event.preventDefault();
+    const needle = needleNow();
+    const index = event.key === "0" ? 9 : Number(event.key) - 1;
+    const board = state.boards.filter((b) => matchesFilter(b, needle))[index];
+    if (board) select(board.name);
+    return;
+  }
   if (event.target instanceof HTMLInputElement) {
     if (event.key === "Escape") event.target.blur();
     return;
   }
-  if (event.metaKey || event.ctrlKey || event.altKey) return;
-  if (els.logs.open) return;  // the modal owns the keyboard
+  if (event.altKey || event.metaKey || event.ctrlKey) return;
   if (event.key === "/") {
     event.preventDefault();
     els.filter.focus();

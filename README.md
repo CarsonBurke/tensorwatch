@@ -110,8 +110,9 @@ Changing a board's port by hand leaves its saved UI on the old one.
 
 ## Dashboard
 
-`1`–`9` switch board, `/` filter, `w` close the open pane, `d` detach it,
-`Shift`+`R` reload it, `q` collapse the queue, `r` reload the registry.
+`1`–`9` switch board, `Ctrl`+`1`–`0` the same through board 10, `/` filter,
+`w` close the open pane, `d` detach it, `Shift`+`R` reload it, `q` collapse
+the queue, `r` reload the registry. Each queue row has a cancel control.
 
 A row marked `▶ 12s` is receiving data: that is the newest `events.out.tfevents*`
 write under its logdir, so it counts any run under `runs/` no matter who started
