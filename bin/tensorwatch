@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run tensorwatch straight from the checkout, no install or virtualenv required.
 set -euo pipefail
-here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+# Follow this script if it is a PATH symlink (~/.local/bin/tensorwatch -> checkout).
+here="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)"
 export PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}"
 exec "${TENSORWATCH_PYTHON:-python3}" -m tensorwatch "$@"

@@ -123,18 +123,31 @@ def open_window(url: str, app_mode: bool = True) -> str:
         "chromium", "google-chrome-stable", "google-chrome", "brave", "brave-browser",
         "microsoft-edge", "vivaldi",
     )
+    env = os.environ.copy()
+    # Chromium looks up its window/tray icon via this desktop file name.
+    env["CHROME_DESKTOP"] = f"{desktop.APP_ID}.desktop"
+    desktop.install_window_entry(url)
+    profile = desktop.chrome_profile()
     for name in candidates:
         binary = shutil.which(name)
         if not binary:
             continue
         argv = [binary, f"--app={url}"] if app_mode else [binary, "--new-window", url]
-        argv.append("--class=tensorwatch")
+        # A shared Chromium instance ignores --class; a private profile does not.
+        argv.extend((
+            f"--class={desktop.APP_ID}",
+            f"--name={desktop.APP_NAME}",
+            f"--user-data-dir={profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ))
         subprocess.Popen(
             argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
         return name
     import webbrowser

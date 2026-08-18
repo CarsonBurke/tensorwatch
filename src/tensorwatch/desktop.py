@@ -15,7 +15,9 @@ from pathlib import Path
 
 APP_ID = "tensorwatch"
 APP_NAME = "TensorWatch"
-ICON_SOURCE = Path(__file__).parent / "web" / "icon.svg"
+WEB_DIR = Path(__file__).parent / "web"
+ICON_SOURCE = WEB_DIR / "icon.svg"
+ICON_PNG_SIZES = (16, 32, 48, 128, 256)
 
 ENTRY_TEMPLATE = """\
 [Desktop Entry]
@@ -32,8 +34,8 @@ Terminal=false
 Categories=Development;
 Keywords=tensorboard;tensorflow;pytorch;jax;training;metrics;ml;
 StartupNotify=true
-# chromium is launched with --class=tensorwatch, so the window groups under this entry.
-StartupWMClass={app_id}
+# Wayland --app windows report chrome-<host>__-Default, not --class.
+StartupWMClass={wm_class}
 Actions=Restart;Registry;
 
 [Desktop Action Restart]
@@ -59,6 +61,14 @@ def icon_dir() -> Path:
     return _data_home() / "icons" / "hicolor" / "scalable" / "apps"
 
 
+def icon_png_path(size: int) -> Path:
+    return _data_home() / "icons" / "hicolor" / f"{size}x{size}" / "apps" / f"{APP_ID}.png"
+
+
+def icon_png_source(size: int) -> Path:
+    return WEB_DIR / f"icon-{size}.png"
+
+
 def bin_dir() -> Path:
     raw = os.environ.get("XDG_BIN_HOME")
     return Path(raw).expanduser() if raw else Path.home() / ".local" / "bin"
@@ -66,6 +76,20 @@ def bin_dir() -> Path:
 
 def entry_path() -> Path:
     return applications_dir() / f"{APP_ID}.desktop"
+
+
+def chrome_app_id(url: str) -> str:
+    """Wayland app id Chromium assigns to ``--app=url`` windows."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    path = (parsed.path or "/").replace("/", "_")
+    return f"chrome-{host}_{path}-Default"
+
+
+def chrome_app_entry_path(url: str) -> Path:
+    return applications_dir() / f"{chrome_app_id(url)}.desktop"
 
 
 def icon_path() -> Path:
@@ -80,6 +104,15 @@ def checkout_launcher() -> Path | None:
     """``bin/tensorwatch`` from this checkout, when running from a source tree."""
     candidate = Path(__file__).resolve().parents[2] / "bin" / APP_ID
     return candidate if candidate.is_file() else None
+
+
+def chrome_profile() -> Path:
+    """Private Chromium profile so --class is not eaten by a running browser."""
+    from .config import state_dir
+
+    path = state_dir() / "chromium-app"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def command() -> str:
@@ -107,19 +140,72 @@ def _quote(value: str) -> str:
     return escaped
 
 
-def render_entry() -> str:
-    from .config import config_path
+def render_entry(*, wm_class: str | None = None, icon: str | None = None) -> str:
+    from .config import config_path, load
 
     base = command()
+    class_name = wm_class or chrome_app_id(load().dashboard_url)
     return ENTRY_TEMPLATE.format(
         name=APP_NAME,
-        app_id=APP_ID,
-        icon=APP_ID,
+        wm_class=class_name,
+        icon=icon or APP_ID,
         exec_open=f"{base} open",
         try_exec=str(checkout_launcher() or shutil.which(APP_ID) or sys.executable),
         exec_restart="systemctl --user restart tensorwatch.service",
         exec_registry=f"xdg-open {_quote(str(config_path()))}",
     )
+
+
+def install_window_entry(url: str) -> Path:
+    """Desktop file whose name matches Chromium's Wayland app id for ``url``.
+
+    COSMIC skips NoDisplay entries and treats dots in Icon= names as reverse-DNS
+    pieces, so this file stays visible and Icon= is an absolute path.
+    """
+    applications_dir().mkdir(parents=True, exist_ok=True)
+    app_id = chrome_app_id(url)
+    path = chrome_app_entry_path(url)
+    icon = str(icon_path() if icon_path().is_file() else ICON_SOURCE)
+    path.write_text(render_entry(wm_class=app_id, icon=icon), encoding="utf-8")
+    path.chmod(0o755)
+    _install_named_icons(app_id)
+    return path
+
+
+def _install_named_icons(name: str) -> list[Path]:
+    """Theme icons keyed by ``name`` so a bar can look the id up like vesktop."""
+    written: list[Path] = []
+    scalable = icon_dir() / f"{name}.svg"
+    icon_dir().mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ICON_SOURCE, scalable)
+    written.append(scalable)
+    for size in ICON_PNG_SIZES:
+        source = icon_png_source(size)
+        if not source.is_file():
+            continue
+        dest = _data_home() / "icons" / "hicolor" / f"{size}x{size}" / "apps" / f"{name}.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
+        written.append(dest)
+    return written
+
+
+def _owned_chrome_entries() -> list[Path]:
+    root = applications_dir()
+    if not root.is_dir():
+        return []
+    return sorted(
+        path
+        for path in root.glob("chrome-*-Default.desktop")
+        if "Name=TensorWatch" in path.read_text(encoding="utf-8", errors="replace")
+    )
+
+
+def _owned_chrome_icons() -> list[Path]:
+    root = _data_home() / "icons" / "hicolor"
+    if not root.is_dir():
+        return []
+    return sorted(root.glob("*/apps/chrome-*-Default.*"))
 
 
 def _refresh_caches() -> None:
@@ -158,15 +244,27 @@ def link_launcher() -> tuple[bool, str]:
 
 def install() -> list[str]:
     """Install the launcher entry, icon and PATH symlink. Returns log lines."""
+    from .config import load
+
     notes: list[str] = []
     icon_dir().mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ICON_SOURCE, icon_path())
     notes.append(f"installed icon {icon_path()}")
+    for size in ICON_PNG_SIZES:
+        source = icon_png_source(size)
+        if not source.is_file():
+            continue
+        dest = icon_png_path(size)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, dest)
+        notes.append(f"installed icon {dest}")
 
     applications_dir().mkdir(parents=True, exist_ok=True)
     entry_path().write_text(render_entry(), encoding="utf-8")
     entry_path().chmod(0o755)
     notes.append(f"installed launcher {entry_path()}")
+    alias = install_window_entry(load().dashboard_url)
+    notes.append(f"installed launcher {alias}")
 
     _ok, message = link_launcher()
     notes.append(message)
@@ -176,7 +274,14 @@ def install() -> list[str]:
 
 def uninstall() -> list[str]:
     notes: list[str] = []
-    for path in (entry_path(), icon_path()):
+    paths = [
+        entry_path(),
+        icon_path(),
+        *(icon_png_path(size) for size in ICON_PNG_SIZES),
+        *_owned_chrome_entries(),
+        *_owned_chrome_icons(),
+    ]
+    for path in paths:
         if path.exists():
             path.unlink()
             notes.append(f"removed {path}")
