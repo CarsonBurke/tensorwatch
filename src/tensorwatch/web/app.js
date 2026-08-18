@@ -499,7 +499,7 @@ function renderQueue() {
           .filter(Boolean).join(" · ")
       : [job.reason || job.state, tag === job.project ? "" : job.project]
           .filter(Boolean).join(" · ");
-    const key = [job.state, when, detail, boards.join(","), tag, index].join("|");
+    const key = [job.state, when, detail, boards.join(","), tag, index, snapshot.connected].join("|");
     if (row.key !== key) {
       row.key = key;
       row.glyph.textContent = running ? "●" : job.state === "held" ? "❚❚" : "○";
@@ -516,6 +516,8 @@ function renderQueue() {
       }
       row.when.textContent = when;
       row.el.className = `job ${job.state}${tag ? " linked" : ""}`;
+      row.kill.hidden = !snapshot.connected;
+      row.kill.title = running ? `kill #${job.id} ${job.name}` : `cancel #${job.id} ${job.name}`;
       row.el.title =
         `#${job.id} ${job.name}\n${job.state}${job.reason ? ` (${job.reason})` : ""}\n${job.cwd}` +
         (boards.length ? `\nboards: ${boards.join(", ")}\nclick to open ${tag}` : "");
@@ -554,7 +556,18 @@ function jobRow(job) {
   label.append(name, meta);
   const when = document.createElement("span");
   when.className = "when";
-  el.append(glyph, label, when);
+  const kill = iconButton("×", "cancel", (event) => {
+    event.stopPropagation();
+    const current = [...(queue()?.running || []), ...(queue()?.queued || [])]
+      .find((candidate) => candidate.id === job.id);
+    if (!current) return;
+    const verb = current.state === "running" ? "kill" : "cancel";
+    post(`/api/queue/${current.id}/cancel`)
+      .then(() => say(`${verb} #${current.id} ${current.name}`, 4000))
+      .catch(reportError);
+  });
+  kill.className = "kill";
+  el.append(glyph, label, when, kill);
   el.addEventListener("click", () => {
     const current = [...(queue()?.running || []), ...(queue()?.queued || [])]
       .find((candidate) => candidate.id === job.id);
@@ -563,10 +576,11 @@ function jobRow(job) {
   });
   els.queueJobs.appendChild(el);
 
-  row = { el, glyph, name, meta, when, key: "" };
+  row = { el, glyph, name, meta, when, kill, key: "" };
   jobRows.set(job.id, row);
   return row;
 }
+
 
 /* ------------------------------------------------------------- pane surface */
 

@@ -5,6 +5,9 @@ TensorWatch subscribes to `mlqd` directly - it opens the Unix socket, sends one
 `mlq` subprocess in the loop: the daemon sends a frame when, and only when, the
 queue changes.
 
+Mutations such as cancel use a separate request/response connection. They must
+not share the subscription socket: any further bytes on that stream end it.
+
 Wire format (mlqueue/src/protocol.rs): big-endian u32 length prefix followed by
 JSON. The reply payload of a subscription frame is the same ``status`` view that
 ``mlq status --json`` prints, so one parser serves both.
@@ -267,17 +270,82 @@ def parse(
     )
 
 
+def encode_request(op: Mapping[str, Any], *, idempotency_key: str | None = None) -> bytes:
+    """One length-prefixed mlqd request frame."""
+    payload: dict[str, Any] = {
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": uuid.uuid4().hex,
+        "op": op,
+    }
+    if idempotency_key is not None:
+        payload["idempotency_key"] = idempotency_key
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    return struct.pack(">I", len(body)) + body
+
+
 def subscribe_request() -> bytes:
     """The single framed request that turns a connection into a subscription."""
-    body = json.dumps(
-        {
-            "protocol_version": PROTOCOL_VERSION,
-            "request_id": uuid.uuid4().hex,
-            "op": {"type": "subscribe"},
-        },
-        separators=(",", ":"),
-    ).encode()
-    return struct.pack(">I", len(body)) + body
+    return encode_request({"type": "subscribe"})
+
+
+class QueueError(Exception):
+    """An mlqd mutation failed, or the daemon could not be reached."""
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def cancel(
+    job: int,
+    path: Path | None = None,
+    *,
+    force: bool = False,
+    timeout: float = 5.0,
+) -> Mapping[str, Any]:
+    """Cancel one mlq job over a request/response connection.
+
+    Queued and held work becomes terminal immediately. Running work is signalled
+    and stays live until the process group drains.
+    """
+    if job < 1:
+        raise QueueError(f"invalid job id {job}", "invalid_argument")
+    target = path or socket_path()
+    if not target.exists():
+        raise QueueError(f"mlqd socket not found at {target}")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(target))
+            sock.sendall(
+                encode_request(
+                    {"type": "cancel", "job": job, "force": force},
+                    idempotency_key=uuid.uuid4().hex,
+                )
+            )
+            frame = read_frame(sock)
+            if not frame:
+                raise QueueError("mlqd sent no reply")
+            return job_view(frame)
+    except TimeoutError as exc:
+        raise QueueError("mlqd did not answer") from exc
+    except (OSError, ConnectionError, json.JSONDecodeError, struct.error) as exc:
+        raise QueueError(str(exc) or exc.__class__.__name__) from exc
+
+
+def job_view(frame: bytes) -> Mapping[str, Any]:
+    """Extract the ``job`` view from a mutation reply, or raise QueueError."""
+    payload = json.loads(frame)
+    error = payload.get("error")
+    if error:
+        raise QueueError(
+            f"{error.get('code', 'error')}: {error.get('message', '')}",
+            error.get("code"),
+        )
+    reply = payload.get("reply") or {}
+    if reply.get("type") != "job":
+        raise QueueError(f"unexpected reply {reply.get('type')!r}")
+    return reply.get("job") or {}
 
 
 def read_frame(sock: socket.socket) -> bytes | None:
@@ -480,9 +548,13 @@ def one_shot(
 
 
 __all__: Sequence[str] = (
+    "QueueError",
     "QueueJob",
     "QueueSnapshot",
     "QueueSubscriber",
+    "cancel",
+    "encode_request",
+    "job_view",
     "one_shot",
     "parse",
     "socket_path",

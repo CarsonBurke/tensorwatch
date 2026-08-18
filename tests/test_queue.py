@@ -116,6 +116,96 @@ def test_subscribe_request_is_the_documented_frame():
     assert body["request_id"]
 
 
+def test_cancel_request_is_the_documented_frame():
+    payload = queue.encode_request(
+        {"type": "cancel", "job": 7, "force": False}, idempotency_key="k"
+    )
+    (length,) = struct.unpack(">I", payload[:4])
+    body = json.loads(payload[4:])
+    assert length == len(payload) - 4
+    assert body["protocol_version"] == queue.PROTOCOL_VERSION
+    assert body["op"] == {"type": "cancel", "job": 7, "force": False}
+    assert body["idempotency_key"] == "k"
+    assert body["request_id"]
+
+
+def test_job_view_surfaces_daemon_errors():
+    with pytest.raises(queue.QueueError, match="not_found") as excinfo:
+        queue.job_view(
+            json.dumps({"request_id": "x", "error": {"code": "not_found",
+                                                     "message": "job 7 not found"}}).encode()
+        )
+    assert excinfo.value.code == "not_found"
+    with pytest.raises(queue.QueueError, match="unexpected reply"):
+        queue.job_view(json.dumps({"request_id": "x", "reply": {"type": "status"}}).encode())
+
+
+def test_cancel_without_a_daemon(tmp_path):
+    with pytest.raises(queue.QueueError, match="not found"):
+        queue.cancel(7, tmp_path / "absent.sock")
+    with pytest.raises(queue.QueueError, match="invalid job id"):
+        queue.cancel(0, tmp_path / "absent.sock")
+
+
+def test_cancel_sends_a_mutation_and_returns_the_job(tmp_path):
+    path = tmp_path / "mlqd.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(1)
+    requests: list[dict] = []
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            header = conn.recv(4)
+            (length,) = struct.unpack(">I", header)
+            requests.append(json.loads(conn.recv(length)))
+            conn.sendall(frame({
+                "request_id": "x",
+                "reply": {"type": "job", "job": {"id": 7, "name": "run", "state": "cancelled"}},
+            }))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        job = queue.cancel(7, path)
+    finally:
+        listener.close()
+        thread.join(timeout=2)
+
+    assert job["id"] == 7 and job["state"] == "cancelled"
+    assert requests[0]["op"] == {"type": "cancel", "job": 7, "force": False}
+    assert requests[0]["idempotency_key"]
+
+
+def test_cancel_surfaces_a_daemon_error(tmp_path):
+    path = tmp_path / "mlqd.sock"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    listener.listen(1)
+
+    def serve() -> None:
+        conn, _ = listener.accept()
+        with conn:
+            header = conn.recv(4)
+            (length,) = struct.unpack(">I", header)
+            conn.recv(length)
+            conn.sendall(frame({
+                "request_id": "x",
+                "error": {"code": "not_found", "message": "job 9 not found"},
+            }))
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(queue.QueueError, match="not_found") as excinfo:
+            queue.cancel(9, path)
+        assert excinfo.value.code == "not_found"
+    finally:
+        listener.close()
+        thread.join(timeout=2)
+
+
 def test_status_view_surfaces_daemon_errors():
     with pytest.raises(ConnectionError, match="unsupported_protocol"):
         queue.status_view(

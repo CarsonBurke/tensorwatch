@@ -17,9 +17,10 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from .queue import QueueError
 from .supervisor import Supervisor
 
 WEB_ROOT = Path(__file__).parent / "web"
@@ -46,9 +47,11 @@ class ControlServer(ThreadingHTTPServer):
         address: tuple[str, int],
         supervisor: Supervisor,
         on_reload: Callable[[], None] | None = None,
+        on_cancel: Callable[[int], Any] | None = None,
     ) -> None:
         self.supervisor = supervisor
         self.on_reload = on_reload
+        self.on_cancel = on_cancel
         self.started_at = time.time()
         super().__init__(address, ControlHandler)
 
@@ -94,6 +97,17 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     def _error(self, status: HTTPStatus, message: str) -> None:
         self._json({"error": message}, status)
+
+    def _queue_error(self, exc: QueueError) -> None:
+        status = {
+            "not_found": HTTPStatus.NOT_FOUND,
+            "invalid_state": HTTPStatus.CONFLICT,
+            "invalid_argument": HTTPStatus.BAD_REQUEST,
+            "unsafe_resolution": HTTPStatus.CONFLICT,
+            "missing_idempotency_key": HTTPStatus.BAD_REQUEST,
+            "idempotency_conflict": HTTPStatus.CONFLICT,
+        }.get(exc.code, HTTPStatus.BAD_GATEWAY)
+        self._error(status, str(exc))
 
     def _local_only(self) -> bool:
         """Reject cross-origin and non-loopback-addressed requests.
@@ -178,6 +192,24 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return self._json(self.supervisor.state_json())
 
+        if len(parts) == 4 and parts[:2] == ["api", "queue"] and parts[3] == "cancel":
+            try:
+                job = int(parts[2])
+            except ValueError:
+                return self._error(HTTPStatus.BAD_REQUEST, "job must be an integer")
+            if job < 1:
+                return self._error(HTTPStatus.BAD_REQUEST, "job must be a positive integer")
+            cancel_hook = self.server.on_cancel  # type: ignore[attr-defined]
+            if cancel_hook is None:
+                return self._error(HTTPStatus.NOT_IMPLEMENTED, "queue cancel unavailable")
+            try:
+                cancel_hook(job)
+            except QueueError as exc:
+                return self._queue_error(exc)
+            except Exception as exc:
+                return self._error(HTTPStatus.BAD_GATEWAY, str(exc))
+            return self._json({"ok": True, "job": job, "action": "cancel"})
+
         if len(parts) == 4 and parts[:2] == ["api", "boards"]:
             name, action = parts[2], parts[3]
             if action not in ("start", "stop", "restart", "demand"):
@@ -250,9 +282,10 @@ def serve(
     host: str,
     port: int,
     on_reload: Callable[[], None] | None = None,
+    on_cancel: Callable[[int], Any] | None = None,
 ) -> ControlServer:
     """Start the control server on a background thread and return it."""
-    server = ControlServer((host, port), supervisor, on_reload)
+    server = ControlServer((host, port), supervisor, on_reload, on_cancel)
     thread = threading.Thread(target=server.serve_forever, name="tensorwatch-httpd", daemon=True)
     thread.start()
     return server

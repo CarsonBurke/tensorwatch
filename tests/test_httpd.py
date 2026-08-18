@@ -54,11 +54,17 @@ def test_serves_dashboard_and_assets(stack):
     status, headers, body = fetch(f"{base}/")
     assert status == 200
     assert b"<title>TensorWatch</title>" in body
+    assert b'href="/static/icon-32.png"' in body
     assert headers["Content-Type"].startswith("text/html")
 
     status, headers, body = fetch(f"{base}/static/app.js")
     assert status == 200 and b"keep_warm" in body
     etag = headers["ETag"]
+
+    status, headers, body = fetch(f"{base}/static/icon-32.png")
+    assert status == 200
+    assert body[:8] == b"\x89PNG\r\n\x1a\n"
+    assert "png" in headers["Content-Type"]
 
     # Unchanged assets are not re-sent.
     with pytest.raises(urllib.error.HTTPError) as excinfo:
@@ -112,6 +118,67 @@ def test_reload_hook(stack):
     base, _, reloads = stack
     fetch(f"{base}/api/reload", method="POST")
     assert reloads == [1]
+
+
+def test_queue_cancel_unavailable_without_a_hook(stack):
+    base, _, _ = stack
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        fetch(f"{base}/api/queue/7/cancel", method="POST")
+    assert excinfo.value.code == 501
+
+
+def test_queue_cancel_rejects_a_bad_id(stack):
+    base, _, _ = stack
+    for url in (f"{base}/api/queue/nope/cancel", f"{base}/api/queue/0/cancel"):
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            fetch(url, method="POST")
+        assert excinfo.value.code == 400
+
+
+def test_queue_cancel_drives_the_hook(home, tmp_path, fake_tb, free_port):
+    from tensorwatch.queue import QueueError
+
+    logdir = tmp_path / "runs"
+    logdir.mkdir()
+    board = BoardSpec(
+        name="fake",
+        port=free_port(),
+        logdir=logdir,
+        command=tuple(fake_tb),
+        autostart="manual",
+    )
+    cfg = Config(
+        server=ServerSpec(port=0, poll_interval=0.1, start_stagger=0.0),
+        boards=(board,),
+        path=tmp_path / "config.toml",
+    )
+    supervisor = Supervisor(cfg)
+    supervisor.start()
+    cancelled: list[int] = []
+
+    def on_cancel(job: int):
+        cancelled.append(job)
+        if job == 99:
+            raise QueueError("not_found: job 99 not found", "not_found")
+        return {"id": job, "state": "cancelled"}
+
+    server = httpd.serve(supervisor, "127.0.0.1", 0, None, on_cancel)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        _, _, body = fetch(f"{base}/api/queue/7/cancel", method="POST")
+        assert json.loads(body) == {"ok": True, "job": 7, "action": "cancel"}
+        assert cancelled == [7]
+
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            fetch(f"{base}/api/queue/99/cancel", method="POST")
+        assert excinfo.value.code == 404
+        assert json.loads(excinfo.value.read())["error"] == "not_found: job 99 not found"
+        assert cancelled == [7, 99]
+    finally:
+        server.shutdown()
+        server.server_close()
+        supervisor.shutdown()
+
 
 
 def test_cross_origin_requests_are_refused(stack):

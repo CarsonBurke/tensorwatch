@@ -215,7 +215,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
         )
         supervisor.set_queue_source(subscriber.snapshot)
 
-    server = httpd.serve(supervisor, cfg.server.host, cfg.server.port, do_reload)
+    def do_cancel(job: int):
+        path = Path(current["cfg"].queue.socket).expanduser() if current["cfg"].queue.socket else None
+        return queue.cancel(job, path)
+
+    server = httpd.serve(
+        supervisor,
+        cfg.server.host,
+        cfg.server.port,
+        do_reload,
+        do_cancel if cfg.queue.enabled else None,
+    )
     supervisor.start()
 
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
