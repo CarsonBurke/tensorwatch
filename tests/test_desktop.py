@@ -49,7 +49,8 @@ def test_install_places_icon_entry_and_symlink(xdg):
     alias = desktop.chrome_app_entry_path("http://127.0.0.1:6005/")
     assert alias.is_file()
     text = alias.read_text()
-    assert "NoDisplay=" not in text
+    assert "NoDisplay=true" in text
+    assert "NoDisplay=" not in desktop.entry_path().read_text()
     assert f"Icon={desktop.icon_path()}" in text or f"Icon={desktop.ICON_SOURCE}" in text
     named = desktop.icon_dir() / f"{desktop.chrome_app_id('http://127.0.0.1:6005/')}.svg"
     assert named.is_file() and named.read_text().startswith("<svg")

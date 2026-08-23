@@ -34,7 +34,7 @@ Terminal=false
 Categories=Development;
 Keywords=tensorboard;tensorflow;pytorch;jax;training;metrics;ml;
 StartupNotify=true
-# Wayland --app windows report chrome-<host>__-Default, not --class.
+{no_display}# Wayland --app windows report chrome-<host>__-Default, not --class.
 StartupWMClass={wm_class}
 Actions=Restart;Registry;
 
@@ -140,7 +140,7 @@ def _quote(value: str) -> str:
     return escaped
 
 
-def render_entry(*, wm_class: str | None = None, icon: str | None = None) -> str:
+def render_entry(*, wm_class: str | None = None, icon: str | None = None, hidden: bool = False) -> str:
     from .config import config_path, load
 
     base = command()
@@ -153,20 +153,23 @@ def render_entry(*, wm_class: str | None = None, icon: str | None = None) -> str
         try_exec=str(checkout_launcher() or shutil.which(APP_ID) or sys.executable),
         exec_restart="systemctl --user restart tensorwatch.service",
         exec_registry=f"xdg-open {_quote(str(config_path()))}",
+        no_display="NoDisplay=true\n" if hidden else "",
     )
 
 
 def install_window_entry(url: str) -> Path:
     """Desktop file whose name matches Chromium's Wayland app id for ``url``.
 
-    COSMIC skips NoDisplay entries and treats dots in Icon= names as reverse-DNS
-    pieces, so this file stays visible and Icon= is an absolute path.
+    Hidden from the app menu so only ``tensorwatch.desktop`` is a launcher.
+    The file name still has to match the Wayland app id so the running window
+    keeps our icon. Icon= is an absolute path because COSMIC treats dots in
+    icon names as reverse-DNS pieces.
     """
     applications_dir().mkdir(parents=True, exist_ok=True)
     app_id = chrome_app_id(url)
     path = chrome_app_entry_path(url)
     icon = str(icon_path() if icon_path().is_file() else ICON_SOURCE)
-    path.write_text(render_entry(wm_class=app_id, icon=icon), encoding="utf-8")
+    path.write_text(render_entry(wm_class=app_id, icon=icon, hidden=True), encoding="utf-8")
     path.chmod(0o755)
     _install_named_icons(app_id)
     return path
