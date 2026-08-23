@@ -71,7 +71,7 @@ button.ghost:hover { color: var(--fg); }
 }
 .totals .warn { color: var(--warn); }
 
-#filter {
+#filter, .field input {
   width: 100%;
   padding: 5px 8px;
   border: 1px solid var(--line);
@@ -80,8 +80,8 @@ button.ghost:hover { color: var(--fg); }
   color: var(--fg);
   font: inherit;
 }
-#filter::placeholder { color: var(--faint); }
-#filter:focus { outline: none; border-color: var(--muted); }
+#filter::placeholder, .field input::placeholder { color: var(--faint); }
+#filter:focus, .field input:focus { outline: none; border-color: var(--muted); }
 
 .section-head {
   display: flex;
@@ -97,6 +97,14 @@ button.ghost:hover { color: var(--fg); }
   letter-spacing: 0.1em;
   text-transform: uppercase;
   text-align: left;
+}
+.section-label { display: inline-flex; align-items: center; gap: 2px; }
+.section-head .ghost {
+  letter-spacing: 0;
+  text-transform: none;
+  font-size: 14px;
+  font-weight: 500;
+  padding: 0 4px;
 }
 button.section-head:hover { color: var(--muted); }
 
@@ -343,7 +351,7 @@ kbd {
   color: var(--fg-dim);
 }
 
-dialog#logs {
+dialog#logs, dialog#add-board-dialog {
   width: min(1040px, 92vw);
   background: var(--bg-soft);
   color: var(--fg);
@@ -351,8 +359,9 @@ dialog#logs {
   border-radius: 11px;
   padding: 0;
 }
-dialog#logs::backdrop { background: rgba(0, 0, 0, 0.62); }
-dialog#logs header {
+dialog#add-board-dialog { width: min(420px, 92vw); }
+dialog#logs::backdrop, dialog#add-board-dialog::backdrop { background: rgba(0, 0, 0, 0.62); }
+dialog#logs header, dialog#add-board-dialog header {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -360,6 +369,18 @@ dialog#logs header {
   border-bottom: 1px solid var(--line);
 }
 dialog#logs pre { margin: 0; border: 0; border-radius: 0; max-height: 70vh; }
+dialog#add-board-dialog form { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+dialog#add-board-dialog .add-error { color: var(--bad); font-size: 12px; margin: 0; }
+dialog#add-board-dialog .field { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 11px; }
+dialog#add-board-dialog .row { display: flex; gap: 6px; justify-content: flex-end; }
+dialog#add-board-dialog .row button {
+  background: var(--bg);
+  color: var(--fg-dim);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 12px;
+}
+dialog#add-board-dialog .row button:hover { color: var(--fg); border-color: var(--muted); }
 
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: #24282f; border-radius: 5px; }

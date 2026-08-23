@@ -34,6 +34,12 @@ const els = {
   logsTitle: $("logs-title"),
   logsBody: $("logs-body"),
   logsClose: $("logs-close"),
+  addBoard: $("add-board"),
+  addDialog: $("add-board-dialog"),
+  addClose: $("add-board-close"),
+  addForm: $("add-board-form"),
+  addPath: $("add-board-path"),
+  addError: $("add-board-error"),
 };
 
 const ACTIVE_KEY = "tensorwatch.active";
@@ -86,8 +92,12 @@ const queue = () => state.queue;
 
 /* --------------------------------------------------------------------- api */
 
-async function post(path) {
-  const response = await fetch(path, { method: "POST" });
+async function post(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
   if (!response.ok) {
     const detail = await response.json().catch(() => ({}));
     throw new Error(detail.error || response.statusText);
@@ -680,6 +690,31 @@ async function showLogs(name) {
   els.logsBody.scrollTop = els.logsBody.scrollHeight;
 }
 
+/* ----------------------------------------------------------------- add board */
+
+function showAddBoard() {
+  els.addPath.value = "";
+  els.addError.hidden = true;
+  els.addError.textContent = "";
+  els.addDialog.showModal();
+  els.addPath.focus();
+}
+
+async function submitAddBoard(event) {
+  event.preventDefault();
+  const path = els.addPath.value.trim();
+  if (!path) return;
+  try {
+    const result = await post("/api/boards", { path });
+    els.addDialog.close();
+    say(`registered ${result.board}`, 4000);
+  } catch (err) {
+    els.addError.textContent = err && err.message ? err.message : String(err);
+    els.addError.hidden = false;
+    reportError(err);
+  }
+}
+
 /* ------------------------------------------------------------------ stream */
 
 function absorb(payload) {
@@ -721,6 +756,12 @@ els.filter.addEventListener("input", schedule);
 els.logsClose.addEventListener("click", () => els.logs.close());
 // The opener lives in a hover-only action row, so the UA cannot restore focus.
 els.logs.addEventListener("close", () => els.filter.focus());
+els.addBoard.addEventListener("click", showAddBoard);
+els.addClose.addEventListener("click", () => els.addDialog.close());
+els.addForm.addEventListener("submit", (event) => {
+  submitAddBoard(event);
+});
+els.addDialog.addEventListener("close", () => els.filter.focus());
 els.queueMore.addEventListener("click", () => {
   queueExpanded = !queueExpanded;
   schedule();
@@ -743,7 +784,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 document.addEventListener("keydown", (event) => {
-  if (els.logs.open) return;  // the modal owns the keyboard
+  if (els.logs.open || els.addDialog.open) return;  // the modal owns the keyboard
   if (event.ctrlKey && !event.metaKey && !event.altKey && event.key >= "0" && event.key <= "9") {
     event.preventDefault();
     const needle = needleNow();
@@ -760,6 +801,11 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "/") {
     event.preventDefault();
     els.filter.focus();
+    return;
+  }
+  if (event.key === "+" || event.key === "=") {
+    event.preventDefault();
+    showAddBoard();
     return;
   }
   if (event.key >= "1" && event.key <= "9") {

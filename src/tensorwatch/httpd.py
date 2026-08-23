@@ -21,6 +21,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from .queue import QueueError
+from .registry import RegistryError
 from .supervisor import Supervisor
 
 WEB_ROOT = Path(__file__).parent / "web"
@@ -48,10 +49,12 @@ class ControlServer(ThreadingHTTPServer):
         supervisor: Supervisor,
         on_reload: Callable[[], None] | None = None,
         on_cancel: Callable[[int], Any] | None = None,
+        on_add: Callable[[str], Any] | None = None,
     ) -> None:
         self.supervisor = supervisor
         self.on_reload = on_reload
         self.on_cancel = on_cancel
+        self.on_add = on_add
         self.started_at = time.time()
         super().__init__(address, ControlHandler)
 
@@ -176,8 +179,7 @@ class ControlHandler(BaseHTTPRequestHandler):
         # Drain the body before any early return, or the unread bytes are parsed
         # as the next request on this keep-alive connection.
         length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
+        raw = self.rfile.read(length) if length else b""
         if not self._local_only():
             return self._error(HTTPStatus.FORBIDDEN, "cross-origin request refused")
         parts = urlparse(self.path).path.strip("/").split("/")
@@ -191,6 +193,9 @@ class ControlHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._error(HTTPStatus.BAD_REQUEST, str(exc))
             return self._json(self.supervisor.state_json())
+
+        if parts == ["api", "boards"]:
+            return self._add_board(raw)
 
         if len(parts) == 4 and parts[:2] == ["api", "queue"] and parts[3] == "cancel":
             try:
@@ -220,6 +225,27 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return self._error(HTTPStatus.NOT_FOUND, f"no board {name!r}")
             return self._json({"ok": True, "board": name, "action": action})
         return self._error(HTTPStatus.NOT_FOUND, "not found")
+
+    def _add_board(self, raw: bytes) -> None:
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return self._error(HTTPStatus.BAD_REQUEST, "invalid JSON")
+        if not isinstance(payload, dict):
+            return self._error(HTTPStatus.BAD_REQUEST, "expected a JSON object")
+        path = payload.get("path") or payload.get("logdir")
+        if not isinstance(path, str) or not path.strip():
+            return self._error(HTTPStatus.BAD_REQUEST, "path is required")
+        add_hook = self.server.on_add  # type: ignore[attr-defined]
+        if add_hook is None:
+            return self._error(HTTPStatus.NOT_IMPLEMENTED, "add unavailable")
+        try:
+            result = add_hook(path.strip())
+        except RegistryError as exc:
+            return self._error(HTTPStatus.BAD_REQUEST, str(exc))
+        except Exception as exc:
+            return self._error(HTTPStatus.BAD_REQUEST, str(exc))
+        return self._json(result)
 
     # -------------------------------------------------------------------- static
 
@@ -283,9 +309,10 @@ def serve(
     port: int,
     on_reload: Callable[[], None] | None = None,
     on_cancel: Callable[[int], Any] | None = None,
+    on_add: Callable[[str], Any] | None = None,
 ) -> ControlServer:
     """Start the control server on a background thread and return it."""
-    server = ControlServer((host, port), supervisor, on_reload, on_cancel)
+    server = ControlServer((host, port), supervisor, on_reload, on_cancel, on_add)
     thread = threading.Thread(target=server.serve_forever, name="tensorwatch-httpd", daemon=True)
     thread.start()
     return server

@@ -232,12 +232,23 @@ def cmd_serve(args: argparse.Namespace) -> int:
         path = Path(current["cfg"].queue.socket).expanduser() if current["cfg"].queue.socket else None
         return queue.cancel(job, path)
 
+    def do_add(logdir: str) -> dict[str, Any]:
+        entry = add_board(logdir)
+        do_reload()
+        return {
+            "ok": True,
+            "board": entry["name"],
+            "logdir": entry.get("logdir"),
+            "port": entry["port"],
+        }
+
     server = httpd.serve(
         supervisor,
         cfg.server.host,
         cfg.server.port,
         do_reload,
         do_cancel if cfg.queue.enabled else None,
+        do_add,
     )
     supervisor.start()
 
@@ -300,54 +311,95 @@ def _apply(path: Path, mutate) -> Config:
     return cfg
 
 
-def cmd_add(args: argparse.Namespace) -> int:
+def add_board(
+    logdir: str | None = None,
+    *,
+    logdir_spec: str | None = None,
+    name: str | None = None,
+    force: bool = False,
+    port: int | None = None,
+    autostart: str = "always",
+    reload_interval: float | None = None,
+    samples_per_plugin: str | None = None,
+    command: Sequence[str] | None = None,
+    extra_args: Sequence[str] | None = None,
+    description: str | None = None,
+    disabled: bool = False,
+) -> dict[str, Any]:
+    """Append a board to the registry. Raises ``RegistryError`` on a bad request."""
     path = config_path()
     registry.ensure(path)
     cfg = load(path)
 
     entry: dict[str, Any] = {}
-    if args.logdir_spec:
-        entry["logdir_spec"] = args.logdir_spec
-        default_name = _slug(args.logdir_spec.split(":", 1)[0])
+    if logdir_spec:
+        entry["logdir_spec"] = logdir_spec
+        default_name = _slug(logdir_spec.split(":", 1)[0])
     else:
-        if not args.logdir:
-            return _fail("give a logdir or --logdir-spec")
-        target = Path(args.logdir).expanduser().resolve()
-        if not target.exists() and not args.force:
-            return _fail(f"{target} does not exist (pass --force to register anyway)")
+        if not logdir:
+            raise registry.RegistryError("give a logdir or --logdir-spec")
+        target = Path(logdir).expanduser().resolve()
+        if not target.exists() and not force:
+            raise registry.RegistryError(f"{target} does not exist")
         entry["logdir"] = str(target)
         default_name = _derive_name(target)
 
-    name = args.name or default_name
-    if not NAME_RE.match(name):
-        return _fail(f"invalid name {name!r}")
-    if cfg.board(name):
-        return _fail(f"board {name!r} already registered")
+    resolved = name or default_name
+    if not NAME_RE.match(resolved):
+        raise registry.RegistryError(f"invalid name {resolved!r}")
+    if cfg.board(resolved):
+        raise registry.RegistryError(f"board {resolved!r} already registered")
 
     taken = {spec.port for spec in cfg.boards} | {cfg.server.port}
-    port = args.port or next_free_port(cfg.server.port_base, taken)
-    if port in taken:
-        return _fail(f"port {port} already used by another board")
+    assigned = port or next_free_port(cfg.server.port_base, taken)
+    if assigned in taken:
+        raise registry.RegistryError(f"port {assigned} already used by another board")
 
-    entry = {"name": name, **entry, "port": port}
-    if args.autostart != "always":
-        entry["autostart"] = args.autostart
-    if args.reload_interval is not None:
-        entry["reload_interval"] = args.reload_interval
-    if args.samples_per_plugin:
-        entry["samples_per_plugin"] = args.samples_per_plugin
-    if args.command:
-        entry["command"] = args.command
-    if args.arg:
-        entry["args"] = list(args.arg)
-    if args.description:
-        entry["description"] = args.description
-    if args.disabled:
+    entry = {"name": resolved, **entry, "port": assigned}
+    if autostart != "always":
+        entry["autostart"] = autostart
+    if reload_interval is not None:
+        entry["reload_interval"] = reload_interval
+    if samples_per_plugin:
+        entry["samples_per_plugin"] = samples_per_plugin
+    if command:
+        entry["command"] = command
+    if extra_args:
+        entry["args"] = list(extra_args)
+    if description:
+        entry["description"] = description
+    if disabled:
         entry["enabled"] = False
 
     _apply(path, lambda text: registry.add(text, entry))
-    print(f"registered {name} -> {entry.get('logdir') or entry.get('logdir_spec')} on port {port}")
-    if _notify_reload(cfg):
+    return entry
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    try:
+        entry = add_board(
+            args.logdir,
+            logdir_spec=args.logdir_spec,
+            name=args.name,
+            force=args.force,
+            port=args.port,
+            autostart=args.autostart,
+            reload_interval=args.reload_interval,
+            samples_per_plugin=args.samples_per_plugin,
+            command=args.command,
+            extra_args=args.arg,
+            description=args.description,
+            disabled=args.disabled,
+        )
+    except registry.RegistryError as exc:
+        if "does not exist" in str(exc) and not args.force:
+            return _fail(f"{exc} (pass --force to register anyway)")
+        raise
+    print(
+        f"registered {entry['name']} -> {entry.get('logdir') or entry.get('logdir_spec')} "
+        f"on port {entry['port']}"
+    )
+    if _notify_reload(load()):
         print("running manager reloaded")
     return 0
 

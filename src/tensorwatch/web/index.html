@@ -23,7 +23,13 @@
       </header>
 
       <div id="boards-wrap">
-        <div class="section-head"><span>Boards</span><span id="boards-count"></span></div>
+        <div class="section-head">
+          <span class="section-label">
+            Boards
+            <button id="add-board" class="ghost" title="Register a logdir" aria-label="Add board">+</button>
+          </span>
+          <span id="boards-count"></span>
+        </div>
         <nav id="boards" role="listbox" aria-label="Registered boards"></nav>
       </div>
 
@@ -51,6 +57,7 @@
           <ul class="keys">
             <li><kbd>1</kbd>&ndash;<kbd>9</kbd> switch board, <kbd>Ctrl</kbd>+<kbd>1</kbd>&ndash;<kbd>0</kbd> for 1–10</li>
             <li><kbd>/</kbd> filter</li>
+            <li><kbd>+</kbd> add a board</li>
             <li><kbd>w</kbd> close the open pane</li>
             <li><kbd>d</kbd> detach into its own window</li>
             <li><kbd>Shift</kbd>+<kbd>R</kbd> reload the pane</li>
@@ -64,6 +71,23 @@
     <dialog id="logs" aria-labelledby="logs-title">
       <header><strong id="logs-title">logs</strong><button id="logs-close" class="ghost">close</button></header>
       <pre id="logs-body" tabindex="0"></pre>
+    </dialog>
+
+    <dialog id="add-board-dialog" aria-labelledby="add-board-title">
+      <header>
+        <strong id="add-board-title">Add board</strong>
+        <button id="add-board-close" class="ghost">close</button>
+      </header>
+      <form id="add-board-form">
+        <label class="field">
+          <span>Logdir</span>
+          <input id="add-board-path" type="text" name="path" placeholder="~/path/to/runs" autocomplete="off" spellcheck="false" required />
+        </label>
+        <p id="add-board-error" class="add-error" hidden></p>
+        <div class="row">
+          <button type="submit">Add</button>
+        </div>
+      </form>
     </dialog>
 
     <script src="/static/app.js"></script>

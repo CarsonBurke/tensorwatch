@@ -9,8 +9,8 @@ import urllib.request
 import pytest
 
 from conftest import wait_until
-from tensorwatch import httpd
-from tensorwatch.config import BoardSpec, Config, ServerSpec
+from tensorwatch import cli, httpd
+from tensorwatch.config import BoardSpec, Config, ServerSpec, load
 from tensorwatch.supervisor import Supervisor
 
 
@@ -43,8 +43,11 @@ def stack(home, tmp_path, fake_tb, free_port):
         supervisor.shutdown()
 
 
-def fetch(url: str, method: str = "GET", headers: dict[str, str] = {}):
-    request = urllib.request.Request(url, method=method, headers=headers)
+def fetch(url: str, method: str = "GET", headers: dict[str, str] = {}, data=None):
+    if data is not None and not isinstance(data, (bytes, bytearray)):
+        data = json.dumps(data).encode()
+        headers = {"Content-Type": "application/json", **headers}
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
     with urllib.request.urlopen(request, timeout=10) as response:
         return response.status, response.headers, response.read()
 
@@ -55,6 +58,8 @@ def test_serves_dashboard_and_assets(stack):
     assert status == 200
     assert b"<title>TensorWatch</title>" in body
     assert b'href="/static/icon-32.png"' in body
+    assert b'id="add-board"' in body
+    assert b'id="add-board-dialog"' in body
     assert headers["Content-Type"].startswith("text/html")
 
     status, headers, body = fetch(f"{base}/static/app.js")
@@ -118,6 +123,62 @@ def test_reload_hook(stack):
     base, _, reloads = stack
     fetch(f"{base}/api/reload", method="POST")
     assert reloads == [1]
+
+
+def test_add_board_unavailable_without_a_hook(stack):
+    base, _, _ = stack
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        fetch(f"{base}/api/boards", method="POST", data={"path": "/tmp"})
+    assert excinfo.value.code == 501
+
+
+def test_add_board_rejects_bad_bodies(stack):
+    base, _, _ = stack
+    for data, status in (
+        (b"not-json", 400),
+        ({}, 400),
+        ({"path": ""}, 400),
+        ({"path": 12}, 400),
+    ):
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            fetch(f"{base}/api/boards", method="POST", data=data)
+        assert excinfo.value.code == status
+
+
+def test_add_board_registers_a_logdir(home, tmp_path):
+
+    logdir = tmp_path / "proj" / "runs"
+    logdir.mkdir(parents=True)
+    cfg = Config(
+        server=ServerSpec(port=0, poll_interval=0.1, start_stagger=0.0),
+        boards=(),
+        path=tmp_path / "config.toml",
+    )
+    supervisor = Supervisor(cfg)
+    supervisor.start()
+
+    def on_add(path: str):
+        entry = cli.add_board(path)
+        supervisor.reload(load())
+        return {"ok": True, "board": entry["name"], "port": entry["port"]}
+
+    server = httpd.serve(supervisor, "127.0.0.1", 0, on_add=on_add)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        _, _, body = fetch(f"{base}/api/boards", method="POST", data={"path": str(logdir)})
+        payload = json.loads(body)
+        assert payload["ok"] is True
+        assert payload["board"] == "proj"
+        assert load().board("proj").logdir == logdir.resolve()
+
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            fetch(f"{base}/api/boards", method="POST", data={"path": str(logdir)})
+        assert excinfo.value.code == 400
+        assert "already registered" in json.loads(excinfo.value.read())["error"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        supervisor.shutdown()
 
 
 def test_queue_cancel_unavailable_without_a_hook(stack):
