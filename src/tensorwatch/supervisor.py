@@ -295,6 +295,14 @@ class Supervisor:
                     or runtime.spec.cwd != spec.cwd
                     or dict(runtime.spec.env) != dict(spec.env)
                 )
+                if runtime.spec.autostart != spec.autostart:
+                    # A policy change re-declares intent, so the ad-hoc start/stop
+                    # override from the dashboard must not outlive it.  A running
+                    # board that just became `on_demand` keeps its full idle
+                    # window instead of being reclaimed the same second.
+                    runtime.override = None
+                    if spec.autostart == "on_demand" and runtime.proc is not None:
+                        runtime.last_demand = time.time()
                 runtime.spec = spec
                 if restart_needed and runtime.proc is not None:
                     self._terminate(runtime, "restarting: configuration changed")

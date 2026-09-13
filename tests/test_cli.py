@@ -100,6 +100,23 @@ def test_set_enable_disable_and_rm(tmp_path, capsys):
     assert cli.main(["rm", "b"]) == 1
 
 
+def test_set_autostart_persists_and_rejects_junk(tmp_path):
+    logdir = tmp_path / "runs"
+    logdir.mkdir()
+    cli.main(["add", str(logdir), "--name", "b"])
+
+    cli.set_autostart("b", "on_demand")
+    assert config.load().board("b").autostart == "on_demand"
+    cli.set_autostart("b", "always")
+    assert config.load().board("b").autostart == "always"
+
+    with pytest.raises(cli.registry.RegistryError):
+        cli.set_autostart("b", "whenever")
+    with pytest.raises(cli.registry.RegistryError):
+        cli.set_autostart("nope", "on_demand")
+    assert config.load().board("b").autostart == "always"
+
+
 def test_list_reports_offline_manager(tmp_path, capsys):
     logdir = tmp_path / "runs"
     logdir.mkdir()

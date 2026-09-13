@@ -277,12 +277,23 @@ function boardRow(board) {
     const running = board_ && (board_.state === "running" || board_.state === "starting");
     act(board.name, running ? "stop" : "start").catch(reportError);
   });
+  const demandToggle = iconButton("◷", "on demand", (event) => {
+    event.stopPropagation();
+    const board_ = byName(board.name);
+    if (!board_) return;
+    // Binary by design: "not on demand" means the manager keeps it up.
+    const mode = board_.autostart === "on_demand" ? "always" : "on_demand";
+    post(`/api/boards/${encodeURIComponent(board.name)}/autostart`, { mode })
+      .then(() => say(`${board.name}: ${mode === "on_demand" ? "on demand" : "always on"}`, 4000))
+      .catch(reportError);
+  });
   acts.append(
     power,
     iconButton("↻", "restart", (event) => {
       event.stopPropagation();
       act(board.name, "restart").catch(reportError);
     }),
+    demandToggle,
     iconButton("▤", "log tail", (event) => {
       event.stopPropagation();
       showLogs(board.name);
@@ -298,7 +309,11 @@ function boardRow(board) {
   run.className = "run";
   const runq = document.createElement("span");
   runq.className = "runq";
-  right.append(run, runq, idx, live, acts);
+  // Persistent policy mark: the toggle itself only appears on hover.
+  const demand = document.createElement("span");
+  demand.className = "demand";
+  demand.title = "on demand: starts when opened, stops when idle";
+  right.append(run, runq, demand, idx, live, acts);
 
   el.append(dot, body, right);
   el.addEventListener("click", () => select(board.name));
@@ -310,7 +325,7 @@ function boardRow(board) {
   });
   els.boards.appendChild(el);
 
-  row = { el, name, meta, power, idx, run, runq, key: "" };
+  row = { el, name, meta, power, idx, run, runq, demand, demandToggle, key: "" };
   boardRows.set(board.name, row);
   return row;
 }
@@ -413,10 +428,11 @@ function renderBoards() {
     const number = filtered ? 0 : ++shown;
     const work = activity.get(board.name);
     const mark = runMark(board, work, live);
+    const onDemand = board.autostart === "on_demand";
     const key = [
       board.state, board.target, board.message, meta, board.name === active,
       frames.has(board.name), index, number, filtered, mark.text, mark.queued, mark.title, live,
-      board.writing,
+      board.writing, board.autostart,
     ].join("|");
     if (row.key === key) return;
     row.key = key;
@@ -439,6 +455,11 @@ function renderBoards() {
     row.idx.textContent = number && number <= 10 ? (number === 10 ? "0" : String(number)) : "";
     row.power.textContent = running ? "■" : "▶";
     row.power.title = running ? "stop" : "start";
+    row.demand.textContent = onDemand ? "◷" : "";
+    row.demandToggle.className = onDemand ? "on" : "";
+    row.demandToggle.title = onDemand
+      ? "on demand — click to keep this board always running"
+      : "click to serve on demand: start when opened, stop when idle";
     // Keep DOM order in sync with registry order without rebuilding rows.
     const expected = els.boards.children[index];
     if (expected !== row.el) els.boards.insertBefore(row.el, expected || null);

@@ -188,7 +188,15 @@ button.section-head:hover { color: var(--muted); }
   font-size: 11px;
   line-height: 1;
 }
-.board .acts button:hover { color: var(--fg); }
+/* Lit while the board's policy is on_demand, so the toggle reads as a state. */
+.board .acts button.on { color: var(--fg-dim); }
+.board .acts button:hover, .board .acts button.on:hover { color: var(--fg); }
+.board .demand {
+  font-size: 9px;
+  color: var(--faint);
+  line-height: 1;
+  margin-left: 3px;
+}
 .board .run {
   font: 10px ui-monospace, monospace;
   color: var(--muted);

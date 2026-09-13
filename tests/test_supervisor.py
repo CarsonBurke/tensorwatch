@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+from dataclasses import replace
 from pathlib import Path
 import time
 
@@ -140,6 +141,34 @@ def test_restart_keeps_on_demand_policy(tmp_path, fake_tb, free_port, supervisor
     assert wait_until(lambda: state_of(sup) == "running", timeout=20), sup.snapshot()
     # A restart must not pin the board running: idle stop still applies.
     assert wait_until(lambda: state_of(sup) == "stopped", timeout=25), sup.snapshot()
+
+
+def test_switching_to_on_demand_overrides_a_hand_start(tmp_path, fake_tb, free_port, supervisor):
+    """Flipping the policy from the dashboard must govern a hand-started board."""
+    cfg = build(tmp_path, fake_tb, free_port, autostart="manual", idle_timeout=3.0)
+    sup = supervisor(cfg)
+    sup.request("start", "fake")
+    assert wait_until(lambda: state_of(sup) == "running"), sup.snapshot()
+
+    board = replace(cfg.boards[0], autostart="on_demand")
+    sup.reload(replace(cfg, boards=(board,)))
+    # The running board keeps its idle window instead of dying the same second.
+    time.sleep(0.6)
+    assert state_of(sup) == "running", sup.snapshot()
+    assert wait_until(lambda: state_of(sup) == "stopped", timeout=20), sup.snapshot()
+    assert "idle" in sup.snapshot()[0].message
+
+
+def test_switching_to_always_overrides_a_hand_stop(tmp_path, fake_tb, free_port, supervisor):
+    cfg = build(tmp_path, fake_tb, free_port, autostart="on_demand", idle_timeout=3.0)
+    sup = supervisor(cfg)
+    sup.request("stop", "fake")
+    time.sleep(0.4)
+    assert state_of(sup) == "stopped"
+
+    board = replace(cfg.boards[0], autostart="always")
+    sup.reload(replace(cfg, boards=(board,)))
+    assert wait_until(lambda: state_of(sup) == "running"), sup.snapshot()
 
 
 def test_unhealthy_board_backs_off_instead_of_looping(tmp_path, fake_tb, free_port, supervisor):

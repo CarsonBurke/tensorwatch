@@ -88,6 +88,11 @@ Changing a board's port by hand leaves its saved UI on the old one.
 | `on_demand` | When you open it; stopped after 15 min idle. Use for huge archives. |
 | `manual` | Only `tensorwatch start NAME` or the dashboard button. |
 
+Each dashboard row has a `◷` control that flips that board between `on_demand`
+and `always`. It writes the registry, so the choice survives a restart, and the
+new policy takes over at once: an on-demand board keeps one idle window and then
+stops, an always board comes back up. `manual` stays a registry/CLI choice.
+
 ## Commands
 
 | Command | |
@@ -113,7 +118,7 @@ Changing a board's port by hand leaves its saved UI on the old one.
 `1`–`9` switch board, `Ctrl`+`1`–`0` the same through board 10, `/` filter,
 `+` add a board (path only), `w` close the open pane, `d` detach it,
 `Shift`+`R` reload it, `q` collapse the queue, `r` reload the registry.
-Each queue row has a cancel control.
+Each queue row has a cancel control; each board row has `◷` for on demand.
 
 A row marked `▶ 12s` is receiving data: that is the newest `events.out.tfevents*`
 write under its logdir, so it counts any run under `runs/` no matter who started

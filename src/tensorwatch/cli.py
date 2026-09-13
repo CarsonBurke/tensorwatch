@@ -242,6 +242,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
             "port": entry["port"],
         }
 
+    def do_autostart(name: str, mode: str) -> dict[str, Any]:
+        set_autostart(name, mode, path)
+        do_reload()
+        return {"ok": True, "board": name, "autostart": mode}
+
     server = httpd.serve(
         supervisor,
         cfg.server.host,
@@ -249,6 +254,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         do_reload,
         do_cancel if cfg.queue.enabled else None,
         do_add,
+        do_autostart,
     )
     supervisor.start()
 
@@ -309,6 +315,23 @@ def _apply(path: Path, mutate) -> Config:
     if updated != text:
         registry.write_atomic(path, updated)
     return cfg
+
+
+def set_autostart(name: str, mode: str, path: Path | None = None) -> Config:
+    """Persist a board's autostart policy in the registry.
+
+    The registry is the only place this lives, so a mode flipped from the
+    dashboard survives a manager restart exactly like a hand edit does.
+    """
+    if mode not in AUTOSTART_MODES:
+        raise registry.RegistryError(
+            f"autostart must be one of {', '.join(AUTOSTART_MODES)}, got {mode!r}"
+        )
+
+    def mutate(text: str) -> str:
+        return registry.set_key(text, name, "autostart", mode)
+
+    return _apply(path or config_path(), mutate)
 
 
 def add_board(

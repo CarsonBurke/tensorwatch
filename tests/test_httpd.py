@@ -125,6 +125,52 @@ def test_reload_hook(stack):
     assert reloads == [1]
 
 
+@pytest.fixture
+def autostart_stack(stack):
+    """A second control server on the same supervisor, this one with the hook."""
+    _, supervisor, _ = stack
+    calls: list[tuple[str, str]] = []
+    server = httpd.serve(
+        supervisor, "127.0.0.1", 0, None, None, None,
+        lambda name, mode: calls.append((name, mode)),
+    )
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", calls
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_autostart_endpoint_hands_the_mode_to_the_registry(autostart_stack):
+    base, calls = autostart_stack
+    status, _, body = fetch(f"{base}/api/boards/fake/autostart", method="POST",
+                            data={"mode": "on_demand"})
+    assert status == 200
+    assert json.loads(body) == {"ok": True, "board": "fake", "autostart": "on_demand"}
+    assert calls == [("fake", "on_demand")]
+
+
+def test_autostart_endpoint_rejects_bad_modes_and_boards(autostart_stack):
+    base, calls = autostart_stack
+    for name, data, status in (
+        ("fake", {"mode": "whenever"}, 400),
+        ("fake", {}, 400),
+        ("fake", b"not-json", 400),
+        ("nope", {"mode": "always"}, 404),
+    ):
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            fetch(f"{base}/api/boards/{name}/autostart", method="POST", data=data)
+        assert excinfo.value.code == status
+    assert calls == []
+
+
+def test_autostart_unavailable_without_a_hook(stack):
+    base, _, _ = stack
+    with pytest.raises(urllib.error.HTTPError) as excinfo:
+        fetch(f"{base}/api/boards/fake/autostart", method="POST", data={"mode": "always"})
+    assert excinfo.value.code == 501
+
+
 def test_add_board_unavailable_without_a_hook(stack):
     base, _, _ = stack
     with pytest.raises(urllib.error.HTTPError) as excinfo:

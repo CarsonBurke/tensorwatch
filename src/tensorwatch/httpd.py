@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
+from .config import AUTOSTART_MODES
 from .queue import QueueError
 from .registry import RegistryError
 from .supervisor import Supervisor
@@ -50,11 +51,13 @@ class ControlServer(ThreadingHTTPServer):
         on_reload: Callable[[], None] | None = None,
         on_cancel: Callable[[int], Any] | None = None,
         on_add: Callable[[str], Any] | None = None,
+        on_autostart: Callable[[str, str], Any] | None = None,
     ) -> None:
         self.supervisor = supervisor
         self.on_reload = on_reload
         self.on_cancel = on_cancel
         self.on_add = on_add
+        self.on_autostart = on_autostart
         self.started_at = time.time()
         super().__init__(address, ControlHandler)
 
@@ -217,6 +220,8 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         if len(parts) == 4 and parts[:2] == ["api", "boards"]:
             name, action = parts[2], parts[3]
+            if action == "autostart":
+                return self._set_autostart(name, raw)
             if action not in ("start", "stop", "restart", "demand"):
                 return self._error(HTTPStatus.NOT_FOUND, f"unknown action {action!r}")
             try:
@@ -225,6 +230,30 @@ class ControlHandler(BaseHTTPRequestHandler):
                 return self._error(HTTPStatus.NOT_FOUND, f"no board {name!r}")
             return self._json({"ok": True, "board": name, "action": action})
         return self._error(HTTPStatus.NOT_FOUND, "not found")
+
+    def _set_autostart(self, name: str, raw: bytes) -> None:
+        """Persist a board's autostart policy; the registry is the source of truth."""
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return self._error(HTTPStatus.BAD_REQUEST, "invalid JSON")
+        if not isinstance(payload, dict):
+            return self._error(HTTPStatus.BAD_REQUEST, "expected a JSON object")
+        mode = payload.get("mode")
+        if mode not in AUTOSTART_MODES:
+            return self._error(
+                HTTPStatus.BAD_REQUEST, f"mode must be one of {', '.join(AUTOSTART_MODES)}"
+            )
+        if not any(board.name == name for board in self.supervisor.snapshot()):
+            return self._error(HTTPStatus.NOT_FOUND, f"no board {name!r}")
+        hook = self.server.on_autostart  # type: ignore[attr-defined]
+        if hook is None:
+            return self._error(HTTPStatus.NOT_IMPLEMENTED, "autostart unavailable")
+        try:
+            hook(name, mode)
+        except Exception as exc:
+            return self._error(HTTPStatus.BAD_REQUEST, str(exc))
+        return self._json({"ok": True, "board": name, "autostart": mode})
 
     def _add_board(self, raw: bytes) -> None:
         try:
@@ -310,9 +339,12 @@ def serve(
     on_reload: Callable[[], None] | None = None,
     on_cancel: Callable[[int], Any] | None = None,
     on_add: Callable[[str], Any] | None = None,
+    on_autostart: Callable[[str, str], Any] | None = None,
 ) -> ControlServer:
     """Start the control server on a background thread and return it."""
-    server = ControlServer((host, port), supervisor, on_reload, on_cancel, on_add)
+    server = ControlServer(
+        (host, port), supervisor, on_reload, on_cancel, on_add, on_autostart
+    )
     thread = threading.Thread(target=server.serve_forever, name="tensorwatch-httpd", daemon=True)
     thread.start()
     return server
