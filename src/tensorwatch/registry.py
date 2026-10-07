@@ -50,7 +50,7 @@ class Block:
     name: str
     data: Mapping[str, Any]
     start: int  # index of the [[board]] header line
-    end: int  # exclusive, trailing blank lines excluded
+    end: int  # exclusive, trailing blank lines and comments excluded
 
 
 def _ends_block(line: str) -> bool:
@@ -85,11 +85,29 @@ def blocks(text: str) -> list[Block]:
                 break
         while end > index + 1 and not lines[end - 1].strip():
             end -= 1
-        chunk = "".join(lines[index:end])
-        try:
-            data = tomllib.loads(chunk)["board"][0]
-        except Exception as exc:  # malformed block: surface it with context
-            raise RegistryError(f"cannot parse board block at line {index + 1}: {exc}") from exc
+        # Trailing comments are not the block's: a comment there is the one
+        # written on top of whatever comes next.
+        trimmed = end
+        while trimmed > index + 1 and (
+            not lines[trimmed - 1].strip() or lines[trimmed - 1].lstrip().startswith("#")
+        ):
+            trimmed -= 1
+        # A "#" line can also be the tail of a multi-line string, so cut as much
+        # as still leaves a block that parses.
+        data = None
+        failure: Exception | None = None
+        for candidate in range(trimmed, end + 1):
+            try:
+                data = tomllib.loads("".join(lines[index:candidate]))["board"][0]
+            except Exception as exc:  # noqa: BLE001 - reported below with context
+                failure = failure or exc
+                continue
+            end = candidate
+            break
+        if data is None:  # malformed block: surface it with context
+            raise RegistryError(
+                f"cannot parse board block at line {index + 1}: {failure}"
+            ) from failure
         found.append(Block(name=_name_of(data), data=data, start=index, end=end))
     return found
 
@@ -168,14 +186,91 @@ def add(text: str, entry: Mapping[str, Any]) -> str:
     return prefix + separator + render_block(entry)
 
 
-def remove(text: str, name: str) -> str:
+@dataclass(frozen=True, slots=True)
+class Taken:
+    """A board cut out of the registry, with what is needed to put it back."""
+
+    #: Exactly as written: key order, inline comments, sub-tables, and the
+    #: blank line that followed it.
+    chunk: str
+    #: Line it started on.
+    line: int
+    #: Boards that came after it, nearest first.
+    following: tuple[str, ...]
+
+
+def take(text: str, name: str) -> tuple[str, Taken]:
+    """Cut board ``name`` out; return the new text and what was taken."""
+    found = blocks(text)
     block = _find(text, name)
     lines = text.splitlines(keepends=True)
     end = block.end
     # Swallow the blank separator that followed the block, if any.
     if end < len(lines) and not lines[end].strip():
         end += 1
-    return "".join(lines[: block.start] + lines[end:])
+    taken = Taken(
+        chunk="".join(lines[block.start : end]),
+        line=block.start,
+        following=tuple(other.name for other in found if other.start > block.start),
+    )
+    return "".join(lines[: block.start] + lines[end:]), taken
+
+
+def remove(text: str, name: str) -> str:
+    return take(text, name)[0]
+
+
+def _is_key_line(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith(("#", "["))
+
+
+def insert(text: str, taken: Taken) -> str:
+    """Put a board cut by :func:`take` back where it was.
+
+    On an unchanged file that is the exact line it came from.  Otherwise it goes
+    in front of the nearest board that used to follow it and is still there, so
+    undoing several removals in any order rebuilds the original order; failing
+    that it is appended.  The chunk must be exactly one board whose name is free.
+    """
+    chunk = taken.chunk if taken.chunk.endswith("\n") else taken.chunk + "\n"
+    parsed = blocks(chunk)
+    trailing = chunk.splitlines()[parsed[0].end :] if parsed else []
+    if len(parsed) != 1 or parsed[0].start != 0 or any(line.strip() for line in trailing):
+        raise RegistryError("expected exactly one [[board]] block")
+    name = parsed[0].name
+    if not name:
+        raise RegistryError("entry needs a name")
+    found = blocks(text)
+    if any(block.name == name for block in found):
+        raise RegistryError(f"board {name!r} already registered")
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    successor = next(
+        (block for wanted in taken.following for block in found if block.name == wanted), None
+    )
+    at = taken.line
+    if 0 <= at <= len(lines):
+        # The original line is only trusted if nothing moved around it: the next
+        # board from there must be the one that used to follow, and no key of
+        # some other table may sit in between for the restored block to capture.
+        ahead = next(
+            (i for i in range(at, len(lines)) if lines[i].lstrip().startswith(_TABLE_START)),
+            len(lines),
+        )
+        next_board = next((block for block in found if block.start >= at), None)
+        if next_board is successor and not any(_is_key_line(line) for line in lines[at:ahead]):
+            return "".join(lines[:at]) + chunk + "".join(lines[at:])
+    if successor is not None:
+        separator = "" if chunk.endswith("\n\n") else "\n"
+        return (
+            "".join(lines[: successor.start]) + chunk + separator
+            + "".join(lines[successor.start :])
+        )
+    separator = [] if not lines or not lines[-1].strip() else ["\n"]
+    return "".join(lines + separator) + chunk.rstrip("\n") + "\n"
 
 
 def _key_lines(lines: list[str], block: Block) -> dict[str, int]:

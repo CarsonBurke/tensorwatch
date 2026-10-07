@@ -39,7 +39,8 @@ Without systemd: `tensorwatch serve` (optionally `--window`).
 ## Daily use
 
 ```bash
-tensorwatch add ~/path/to/runs          # register
+tensorwatch add ~/path/to/runs          # register (several paths at once is fine)
+tensorwatch rm cleanrl                  # unregister, by name or by logdir
 tensorwatch list                        # registry + live state
 tensorwatch open                        # dashboard window
 tensorwatch open cleanrl                # that board only
@@ -49,7 +50,13 @@ tensorwatch doctor
 ```
 
 `scan` walks a tree for `events.out.tfevents*` files and groups them: a
-`runs/` or `tb_logs/` ancestor becomes one board, not one per timestamped run.
+`runs/` or `tb_logs/` directory becomes one board, not one per timestamped run,
+and is probed rather than walked, so a logdir with thousands of runs costs the
+same as one with three.
+
+`add` names a board after its repository (`cleanrl/runs` is `cleanrl`, a second
+logdir there is `cleanrl-runs_old`), refuses a logdir that already is a board,
+and says so when the directory holds no event files yet.
 
 ## Registry
 
@@ -97,8 +104,8 @@ stops, an always board comes back up. `manual` stays a registry/CLI choice.
 
 | Command | |
 | --- | --- |
-| `add PATH` | Register a logdir |
-| `rm NAME` | Unregister |
+| `add PATH…` | Register one or more logdirs |
+| `rm NAME…` | Unregister, by name or by logdir |
 | `set NAME KEY=VALUE …` | Change a board (`autostart=on_demand`, `port=6104`, …) |
 | `enable` / `disable NAME` | Leave it in the file, stop supervising it |
 | `scan DIR [--add]` | Discover logdirs |
@@ -116,9 +123,23 @@ stops, an always board comes back up. `manual` stays a registry/CLI choice.
 ## Dashboard
 
 `1`–`9` switch board, `Ctrl`+`1`–`0` the same through board 10, `/` filter,
-`+` add a board (path only), `w` close the open pane, `d` detach it,
-`Shift`+`R` reload it, `q` collapse the queue, `r` reload the registry.
-Each queue row has a cancel control; each board row has `◷` for on demand.
+`+` add a board, `Delete` remove the focused one, `↑`/`↓` move between rows,
+`w` close the open pane, `d` detach it, `Shift`+`R` reload it, `q` collapse the
+queue, `r` reload the registry. Hovering a board row shows its controls: start
+or stop, restart, on demand, log tail, own window, remove. Each queue row has a
+cancel control.
+
+**Adding.** The logdir field completes directories as you type (`Tab` accepts
+and descends, `↑`/`↓` choose) and marks the ones that hold runs. Name and
+autostart policy are optional. Below the form, "Found near your boards" lists
+unregistered logdirs in the repositories next to the ones you already watch;
+each can be added with one click.
+
+**Removing** asks nothing and is undoable: the confirmation offers `Undo` for a
+few seconds, which puts the board's registry block back where it was, port and
+comments included. Several removals can be undone in any order. The removed
+block stays inside the manager and the dashboard only holds a token for it, so
+the unauthenticated API never accepts registry text.
 
 A row marked `▶ 12s` is receiving data: that is the newest `events.out.tfevents*`
 write under its logdir, so it counts any run under `runs/` no matter who started

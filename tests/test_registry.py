@@ -182,3 +182,106 @@ def test_write_atomic_follows_symlinks_and_restricts_mode(home, tmp_path):
     assert link.is_symlink()  # a registry kept in a dotfiles repo stays linked
     assert config.load(link).board("a").port == 6100
     assert real.stat().st_mode & 0o777 == 0o600
+
+
+LAYOUT = """\
+[server]
+port = 6005
+
+# about a
+[[board]]
+name = "a"  # inline note
+logdir = "/a"
+port = 6100
+
+# about b
+[[board]]
+name = "b"
+logdir = "/b"
+port = 6101
+[board.env]
+X = "1"
+
+[[board]]
+name = "c"
+logdir = "/c"
+port = 6102
+# closing note
+
+[defaults]
+autostart = "manual"
+reload_interval = 30
+"""
+
+
+@pytest.mark.parametrize("name", ["a", "b", "c"])
+def test_take_then_insert_restores_the_file_exactly(name):
+    without, taken = registry.take(LAYOUT, name)
+    assert f'name = "{name}"' not in without
+    assert registry.insert(without, taken) == LAYOUT
+
+
+def test_a_comment_above_the_next_board_is_not_removed_with_this_one():
+    without = registry.remove(LAYOUT, "a")
+    assert "# about b" in without
+    assert "# closing note" in registry.remove(LAYOUT, "c")
+
+
+def test_take_carries_inline_comments_and_subtables():
+    assert "# inline note" in registry.take(LAYOUT, "a")[1].chunk
+    assert "[board.env]" in registry.take(LAYOUT, "b")[1].chunk
+    assert registry.take(LAYOUT, "a")[1].following == ("b", "c")
+
+
+def test_a_hash_line_ending_a_multiline_string_is_not_taken_for_a_comment():
+    text = (
+        '[[board]]\nname = "m"\nlogdir = "/m"\ndescription = """\nnotes\n# heading"""\n\n'
+        '# about n\n[[board]]\nname = "n"\nlogdir = "/n"\n'
+    )
+    without, taken = registry.take(text, "m")
+    assert taken.chunk.rstrip().endswith('# heading"""')
+    assert without.startswith("# about n")
+    assert registry.insert(without, taken) == text
+
+
+def test_boards_removed_in_any_order_come_back_in_any_order_when_told_what_follows():
+    import itertools
+
+    for removal in itertools.permutations("abc"):
+        for undo in itertools.permutations("abc"):
+            text, cut = LAYOUT, {}
+            for name in removal:
+                text, cut[name] = registry.take(text, name)
+            for name in undo:
+                # As RegistryOps does: what follows is read off the original order.
+                after = tuple("abc"["abc".index(name) + 1 :])
+                text = registry.insert(text, registry.Taken(cut[name].chunk, cut[name].line, after))
+            parsed = config.parse(text)
+            assert [board.name for board in parsed.boards] == ["a", "b", "c"], (removal, undo)
+            # Nothing was spliced into the [defaults] table that trails the boards.
+            assert [board.autostart for board in parsed.boards] == ["manual"] * 3
+            assert text.count("reload_interval = 30") == 1
+
+
+def test_a_stale_line_inside_another_table_is_not_trusted():
+    without, taken = registry.take(LAYOUT, "b")
+    inside_defaults = without.splitlines().index('autostart = "manual"') + 1
+    inside_board = without.splitlines().index('logdir = "/a"')
+    for stale in (inside_defaults, inside_board, 1, 10_000, -1):
+        restored = registry.insert(
+            without, registry.Taken(taken.chunk, stale, taken.following)
+        )
+        parsed = config.parse(restored)
+        assert [board.name for board in parsed.boards] == ["a", "b", "c"], stale
+        assert [board.autostart for board in parsed.boards] == ["manual"] * 3, stale
+        assert parsed.boards[1].env == {"X": "1"}
+
+
+def test_insert_only_accepts_one_free_board_block():
+    without, taken = registry.take(LAYOUT, "b")
+    with pytest.raises(registry.RegistryError, match="already registered"):
+        registry.insert(LAYOUT, taken)
+    chunk = taken.chunk
+    for junk in (chunk + "[server]\nport = 1\n", "port = 1\n" + chunk, chunk + chunk, "nonsense"):
+        with pytest.raises(registry.RegistryError, match="exactly one"):
+            registry.insert(without, registry.Taken(junk, taken.line, taken.following))

@@ -5,8 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import resource
+import secrets
 import shutil
 import signal
 import subprocess
@@ -17,9 +17,9 @@ import urllib.error
 import urllib.request
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
-from . import activity, desktop, httpd, queue, registry, service
+from . import activity, desktop, discover, httpd, queue, registry, service
 from .config import (
     AUTOSTART_MODES,
     Config,
@@ -33,28 +33,6 @@ from .config import (
     state_dir,
 )
 from .supervisor import Supervisor, probe, raise_file_limit
-
-#: A directory whose name *starts* with one of these tokens holds a family of runs
-#: rather than being one run: ``runs``, ``runs_old``, ``tb_logs``,
-#: ``lightning_logs``, ``logs_tokenizer_cartpole``.  Requiring the leading token
-#: keeps project names such as ``Rubiks-tensorboard-debug`` out of the rule.
-RUN_DIR_TOKENS = frozenset(
-    {"run", "runs", "log", "logs", "tb", "tblog", "tblogs", "tensorboard",
-     "summaries", "events", "lightning"}
-)
-#: Never walked while scanning: large and never a logdir.
-PRUNE_DIRS = frozenset(
-    {".git", "node_modules", "__pycache__", ".venv", "venv", "site-packages",
-     ".pnpm-store", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".cache",
-     "worktrees", "target", "dist", "build", "bazel-bin", "bazel-out"}
-)
-EVENT_PREFIX = "events.out.tfevents"
-EVENT_GLOB = EVENT_PREFIX + "*"
-
-
-def _is_run_container(name: str) -> bool:
-    return re.split(r"[-_.]+", name.lower())[0] in RUN_DIR_TOKENS
-
 
 # --------------------------------------------------------------------- helpers
 
@@ -79,11 +57,6 @@ def _live_state(cfg: Config) -> dict[str, Any] | None:
         return None
 
 
-def _slug(raw: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-._")
-    return cleaned or "board"
-
-
 def _table(rows: Sequence[Sequence[str]], headers: Sequence[str]) -> str:
     widths = [len(header) for header in headers]
     for row in rows:
@@ -106,15 +79,6 @@ def _human_bytes(value: int | None) -> str:
         size /= 1024
         unit += 1
     return f"{size:.1f}{units[unit]}" if unit and size < 10 else f"{size:.0f}{units[unit]}"
-
-
-def _count_events(path: Path, limit: int = 5000) -> int:
-    total = 0
-    for _ in path.rglob(EVENT_GLOB):
-        total += 1
-        if total >= limit:
-            break
-    return total
 
 
 def open_window(url: str, app_mode: bool = True) -> str:
@@ -202,6 +166,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         current["cfg"] = fresh
+        ops.forget_suggestions()
         supervisor.reload(fresh)
         if subscriber is not None:
             # Re-match the queue against the new registry instead of waiting for
@@ -232,20 +197,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         path = Path(current["cfg"].queue.socket).expanduser() if current["cfg"].queue.socket else None
         return queue.cancel(job, path)
 
-    def do_add(logdir: str) -> dict[str, Any]:
-        entry = add_board(logdir)
-        do_reload()
-        return {
-            "ok": True,
-            "board": entry["name"],
-            "logdir": entry.get("logdir"),
-            "port": entry["port"],
-        }
-
-    def do_autostart(name: str, mode: str) -> dict[str, Any]:
-        set_autostart(name, mode, path)
-        do_reload()
-        return {"ok": True, "board": name, "autostart": mode}
+    ops = RegistryOps(path, do_reload, lambda: current["cfg"])
 
     server = httpd.serve(
         supervisor,
@@ -253,8 +205,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
         cfg.server.port,
         do_reload,
         do_cancel if cfg.queue.enabled else None,
-        do_add,
-        do_autostart,
+        ops.add,
+        ops.autostart,
+        ops.remove,
+        ops.restore,
+        discover.complete,
+        ops.suggest,
     )
     supervisor.start()
 
@@ -348,28 +304,38 @@ def add_board(
     extra_args: Sequence[str] | None = None,
     description: str | None = None,
     disabled: bool = False,
+    path: Path | None = None,
 ) -> dict[str, Any]:
     """Append a board to the registry. Raises ``RegistryError`` on a bad request."""
-    path = config_path()
+    path = path or config_path()
     registry.ensure(path)
     cfg = load(path)
 
     entry: dict[str, Any] = {}
     if logdir_spec:
         entry["logdir_spec"] = logdir_spec
-        default_name = _slug(logdir_spec.split(":", 1)[0])
+        default_name = discover.slug(logdir_spec.split(":", 1)[0])
     else:
         if not logdir:
             raise registry.RegistryError("give a logdir or --logdir-spec")
-        target = Path(logdir).expanduser().resolve()
+        target = Path(os.path.expandvars(logdir)).expanduser().resolve()
         if not target.exists() and not force:
             raise registry.RegistryError(f"{target} does not exist")
+        if target.exists() and not target.is_dir():
+            raise registry.RegistryError(f"{target} is not a directory")
+        # Two boards on one logdir are two TensorBoards doing the same work.
+        twin = next((spec for spec in cfg.boards if _same_dir(spec.logdir, target)), None)
+        if twin is not None:
+            raise registry.RegistryError(f"{target} is already registered as {twin.name!r}")
         entry["logdir"] = str(target)
-        default_name = _derive_name(target)
+        # A second logdir in the same repository still gets a name of its own.
+        default_name = discover.unique_name(target, lambda taken: cfg.board(taken) is not None)
 
     resolved = name or default_name
     if not NAME_RE.match(resolved):
-        raise registry.RegistryError(f"invalid name {resolved!r}")
+        raise registry.RegistryError(
+            f"invalid name {resolved!r} (allowed: letters, digits, . _ -)"
+        )
     if cfg.board(resolved):
         raise registry.RegistryError(f"board {resolved!r} already registered")
 
@@ -398,88 +364,236 @@ def add_board(
     return entry
 
 
-def cmd_add(args: argparse.Namespace) -> int:
-    try:
-        entry = add_board(
-            args.logdir,
-            logdir_spec=args.logdir_spec,
-            name=args.name,
-            force=args.force,
-            port=args.port,
-            autostart=args.autostart,
-            reload_interval=args.reload_interval,
-            samples_per_plugin=args.samples_per_plugin,
-            command=args.command,
-            extra_args=args.arg,
-            description=args.description,
-            disabled=args.disabled,
-        )
-    except registry.RegistryError as exc:
-        if "does not exist" in str(exc) and not args.force:
-            return _fail(f"{exc} (pass --force to register anyway)")
-        raise
-    print(
-        f"registered {entry['name']} -> {entry.get('logdir') or entry.get('logdir_spec')} "
-        f"on port {entry['port']}"
-    )
-    if _notify_reload(load()):
-        print("running manager reloaded")
-    return 0
+def suggest_boards(cfg: Config, limit: int = 24) -> list[dict[str, Any]]:
+    """Unregistered logdirs near the registered ones, with the name each would get."""
+    registered = [spec.logdir.resolve() for spec in cfg.boards if spec.logdir is not None]
+    taken = {spec.name for spec in cfg.boards}
+    items: list[dict[str, Any]] = []
+    for root in discover.workspaces(registered):
+        for candidate in discover.discover(root):
+            # A parent or child of a registered logdir would show the same runs.
+            if any(candidate == known or candidate.is_relative_to(known)
+                   or known.is_relative_to(candidate) for known in registered):
+                continue
+            name = discover.unique_name(candidate, taken.__contains__)
+            taken.add(name)
+            items.append(
+                {
+                    "path": discover.tilde(candidate),
+                    "name": name,
+                    "events": discover.count_events(
+                        candidate, limit=1000, budget=discover.COUNT_BUDGET
+                    ),
+                }
+            )
+    # The busiest logdirs first: an empty-looking one is rarely what is wanted.
+    items.sort(key=lambda item: (-item["events"], item["path"]))
+    return items[:limit]
 
 
-def _derive_name(target: Path) -> str:
-    """Name a board after what it watches, qualified by its repository.
+def _same_dir(logdir: Path | None, target: Path) -> bool:
+    return logdir is not None and (logdir == target or logdir.resolve() == target)
 
-    ``.../cleanrl/runs`` -> ``cleanrl`` (the logdir sits at the repo root);
-    ``.../parameter-golf/postraining/runs`` -> ``parameter-golf-postraining``;
-    ``.../xxscreeps/samples/rl/runs`` -> ``xxscreeps-rl``.
 
-    A bare leaf like ``postraining`` or ``rl`` says nothing on its own, so a
-    logdir nested inside a repository carries the repository name too.
+def resolve_board(cfg: Config, ref: str) -> str:
+    """A board's name, given its name or its logdir."""
+    if cfg.board(ref):
+        return ref
+    target = Path(os.path.expandvars(ref)).expanduser().resolve()
+    for spec in cfg.boards:
+        if _same_dir(spec.logdir, target):
+            return spec.name
+    known = ", ".join(spec.name for spec in cfg.boards) or "<none>"
+    raise registry.RegistryError(f"no board named {ref!r} (registered: {known})")
+
+
+def remove_board(name: str, path: Path | None = None) -> registry.Taken:
+    """Unregister a board; the result is what :func:`restore_board` needs to undo it."""
+    taken: list[registry.Taken] = []
+
+    def mutate(text: str) -> str:
+        updated, cut = registry.take(text, name)
+        taken.append(cut)
+        return updated
+
+    _apply(path or config_path(), mutate)
+    return taken[0]
+
+
+def restore_board(taken: registry.Taken, path: Path | None = None) -> str:
+    """Put a removed board back where it was; returns its name."""
+    path = path or config_path()
+    before = {spec.name for spec in load(path).boards}
+    cfg = _apply(path, lambda text: registry.insert(text, taken))
+    return next(spec.name for spec in cfg.boards if spec.name not in before)
+
+
+class RegistryOps:
+    """The registry edits the dashboard may ask for.
+
+    They arrive on HTTP threads, so they are serialised here: two additions at
+    once would otherwise both read the registry, pick the same port, and one
+    would overwrite the other.
+
+    Removal is undoable, and the removed block never leaves this process. The
+    dashboard gets an opaque token instead: the HTTP API is unauthenticated, and
+    a client that could hand back registry text could register a board with any
+    ``command`` it liked.
     """
-    parts = list(target.parts)
-    while len(parts) > 1 and _is_run_container(parts[-1]):
-        parts.pop()
-    leaf = Path(*parts) if parts else target
-    repo = _repo_root(leaf)
-    if repo is not None and repo != leaf:
-        return _slug(f"{repo.name}-{leaf.name}")
-    return _slug(leaf.name)
+
+    #: How long, and how many, removed boards stay restorable.
+    UNDO_TTL = 900.0
+    UNDO_KEEP = 32
+    #: Suggestions walk every repository next to a registered one.
+    SUGGEST_TTL = 60.0
+
+    def __init__(
+        self,
+        path: Path,
+        reload: Callable[[], None],
+        config: Callable[[], Config],
+    ) -> None:
+        self._path = path
+        self._reload = reload
+        self._config = config
+        self._lock = threading.RLock()
+        self._undo: dict[str, tuple[float, registry.Taken]] = {}
+        #: Board order with the removed-but-restorable ones still in their place,
+        #: so undoing several removals in any order rebuilds it.
+        self._order: list[str] = []
+        self._suggested: tuple[float, list[dict[str, Any]]] | None = None
+        self._generation = 0
+
+    def add(
+        self, logdir: str, name: str | None = None, autostart: str | None = None
+    ) -> dict[str, Any]:
+        with self._lock:
+            entry = add_board(logdir, name=name, autostart=autostart or "always", path=self._path)
+            self._reload()
+        return {
+            "ok": True,
+            "board": entry["name"],
+            "logdir": entry.get("logdir"),
+            "port": entry["port"],
+            "events": discover.has_events(entry["logdir"]),
+        }
+
+    def autostart(self, name: str, mode: str) -> dict[str, Any]:
+        with self._lock:
+            set_autostart(name, mode, self._path)
+            self._reload()
+        return {"ok": True, "board": name, "autostart": mode}
+
+    def remove(self, name: str) -> dict[str, Any]:
+        with self._lock:
+            self._remember_order()
+            taken = remove_board(name, self._path)
+            now = time.monotonic()
+            self._undo = {
+                token: kept for token, kept in self._undo.items()
+                if now - kept[0] < self.UNDO_TTL
+            }
+            while len(self._undo) >= self.UNDO_KEEP:
+                del self._undo[next(iter(self._undo))]
+            token = secrets.token_urlsafe(16)
+            self._undo[token] = (now, taken)
+            self._reload()
+        return {"undo": token}
+
+    def restore(self, token: str) -> dict[str, Any]:
+        with self._lock:
+            kept = self._undo.get(token)
+            if kept is None or time.monotonic() - kept[0] >= self.UNDO_TTL:
+                self._undo.pop(token, None)
+                raise registry.RegistryError("that removal can no longer be undone")
+            taken = kept[1]
+            removed = registry.blocks(taken.chunk)[0].name
+            # What followed it then may itself be gone; the remembered order knows
+            # what should follow it now.
+            after = self._order[self._order.index(removed) + 1 :] if removed in self._order else []
+            name = restore_board(replace(taken, following=tuple(after)), self._path)
+            del self._undo[token]
+            self._reload()
+        return {"ok": True, "board": name}
+
+    def _remember_order(self) -> None:
+        current = [spec.name for spec in load(self._path).boards]
+        pending = {registry.blocks(taken.chunk)[0].name for _, taken in self._undo.values()}
+        known = [name for name in self._order if name in current or name in pending]
+        self._order = known + [name for name in current if name not in known]
+
+    def suggest(self) -> list[dict[str, Any]]:
+        with self._lock:
+            generation = self._generation
+            cached = self._suggested
+        if cached is not None and time.monotonic() - cached[0] < self.SUGGEST_TTL:
+            return cached[1]
+        items = suggest_boards(self._config())
+        with self._lock:
+            # A registry change while walking makes this answer stale already.
+            if generation == self._generation:
+                self._suggested = (time.monotonic(), items)
+        return items
+
+    def forget_suggestions(self) -> None:
+        with self._lock:
+            self._generation += 1
+            self._suggested = None
 
 
-def _repo_root(path: Path) -> Path | None:
-    """Nearest ancestor (or ``path`` itself) that is a git repository."""
-    for candidate in (path, *path.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return None
-
-
-def _unique_name(target: Path, is_taken) -> str:
-    """``cleanrl/runs`` -> ``cleanrl``; a second one -> ``cleanrl-runs_old``."""
-    base = _derive_name(target)
-    if not is_taken(base):
-        return base
-    qualified = _slug(f"{base}-{target.name}")
-    if not is_taken(qualified):
-        return qualified
-    index = 2
-    while is_taken(f"{qualified}-{index}"):
-        index += 1
-    return f"{qualified}-{index}"
+def cmd_add(args: argparse.Namespace) -> int:
+    logdirs = args.logdir or [None]
+    if len(logdirs) > 1 and (args.name or args.port or args.logdir_spec):
+        return _fail("--name, --port and --logdir-spec describe one board; add the others separately")
+    failed = 0
+    added = 0
+    for logdir in logdirs:
+        try:
+            entry = add_board(
+                logdir,
+                logdir_spec=args.logdir_spec,
+                name=args.name,
+                force=args.force,
+                port=args.port,
+                autostart=args.autostart,
+                reload_interval=args.reload_interval,
+                samples_per_plugin=args.samples_per_plugin,
+                command=args.command,
+                extra_args=args.arg,
+                description=args.description,
+                disabled=args.disabled,
+            )
+        except (registry.RegistryError, ConfigError) as exc:
+            hint = " (pass --force to register anyway)" if "does not exist" in str(exc) else ""
+            failed += _fail(f"{exc}{hint}")
+            continue
+        added += 1
+        target = entry.get("logdir") or entry.get("logdir_spec")
+        print(f"registered {entry['name']} -> {target} on port {entry['port']}")
+        if "logdir" in entry and not discover.has_events(entry["logdir"]):
+            print("  note: no event files there yet", file=sys.stderr)
+    if added and _notify_reload(load()):
+        print("running manager reloaded")
+    return 1 if failed else 0
 
 
 def cmd_rm(args: argparse.Namespace) -> int:
     path = config_path()
     cfg = load(path)
-    try:
-        _apply(path, lambda text: registry.remove(text, args.name))
-    except registry.RegistryError as exc:
-        return _fail(str(exc))
-    print(f"removed {args.name}")
-    if _notify_reload(cfg):
+    failed = 0
+    removed = 0
+    for ref in args.name:
+        try:
+            name = resolve_board(load(path), ref)
+            remove_board(name, path)
+        except (registry.RegistryError, ConfigError) as exc:
+            failed += _fail(str(exc))
+            continue
+        removed += 1
+        print(f"removed {name}")
+    if removed and _notify_reload(cfg):
         print("running manager reloaded")
-    return 0
+    return 1 if failed else 0
 
 
 def _coerce(raw: str) -> Any:
@@ -677,101 +791,27 @@ def cmd_open(args: argparse.Namespace) -> int:
 # -------------------------------------------------------------------- discovery
 
 
-def _run_dirs(root: Path, max_depth: int) -> list[Path]:
-    """Directories that directly contain event files."""
-    found: list[Path] = []
-    stack: list[tuple[Path, int]] = [(root, 0)]
-    while stack:
-        directory, depth = stack.pop()
-        has_events = False
-        children: list[Path] = []
-        try:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    if entry.is_file(follow_symlinks=False):
-                        has_events = has_events or entry.name.startswith(EVENT_PREFIX)
-                    elif (
-                        entry.is_dir(follow_symlinks=False)
-                        and not entry.name.startswith(".")
-                        and entry.name not in PRUNE_DIRS
-                    ):
-                        children.append(Path(entry.path))
-        except OSError:
-            continue
-        if has_events:
-            found.append(directory)
-        if depth < max_depth:
-            stack.extend((child, depth + 1) for child in children)
-    return found
-
-
-def _proposals(root: Path, run_dirs: list[Path]) -> set[Path]:
-    """Turn directories full of events into the logdirs worth registering.
-
-    Three rules, in order:
-
-    1. A run-container ancestor (``runs``, ``tb_logs``, ``runs_old``, ...) wins, so
-       ``runs_old/ppo/2026-06-08`` registers once as ``runs_old`` instead of once
-       per timestamped run.
-    2. Otherwise sibling runs are grouped: a directory holding two or more runs
-       (``hl-gauss-ablations/<run>/...``) is registered once.
-    3. A lone run is registered as itself - never as its parent, because pointing
-       TensorBoard at a whole project directory makes it walk checkpoints and
-       datasets too.
-    """
-    proposals: set[Path] = set()
-    grouped: dict[Path, set[Path]] = {}
-    for run_dir in run_dirs:
-        parts = run_dir.relative_to(root).parts
-        ancestor = next((i for i, part in enumerate(parts[:-1]) if _is_run_container(part)), None)
-        if ancestor is not None:
-            proposals.add(root.joinpath(*parts[: ancestor + 1]))
-            continue
-        # `exp/tensorboard` is one run living in a per-run subdirectory.
-        unit = run_dir.parent if _is_run_container(run_dir.name) and run_dir.parent != root else run_dir
-        grouped.setdefault(unit.parent, set()).add(unit)
-    for parent, units in grouped.items():
-        if len(units) >= 2 and parent != root:
-            proposals.add(parent)
-        else:
-            proposals |= units
-    return proposals
-
-
-def _discover(root: Path, max_depth: int) -> list[Path]:
-    """Logdirs worth registering under ``root``, shallowest first."""
-    root = root.expanduser().resolve()
-    proposals = _proposals(root, _run_dirs(root, max_depth))
-    ordered = sorted(proposals, key=lambda path: (len(path.parts), str(path)))
-    kept: list[Path] = []
-    for candidate in ordered:
-        if any(candidate.is_relative_to(existing) for existing in kept):
-            continue
-        kept.append(candidate)
-    return kept
-
-
 def cmd_scan(args: argparse.Namespace) -> int:
     root = Path(args.root).expanduser()
     if not root.is_dir():
         return _fail(f"{root} is not a directory")
-    found = _discover(root, args.depth)
+    found = discover.discover(root, args.depth)
     if not found:
         print(f"no event files under {root} (depth {args.depth})")
         return 0
 
     cfg = load()
-    known = {str(spec.logdir) for spec in cfg.boards if spec.logdir}
+    known = {str(spec.logdir.resolve()): spec.name for spec in cfg.boards if spec.logdir}
     taken = {spec.port for spec in cfg.boards} | {cfg.server.port}
     rows, additions = [], []
     for candidate in found:
         if str(candidate) in known:
-            rows.append([_derive_name(candidate), "registered", "-", str(candidate)])
+            rows.append([known[str(candidate)], "registered", "-", str(candidate)])
             continue
-        name = _unique_name(candidate, lambda n: bool(cfg.board(n)) or any(e["name"] == n for e in additions))
+        name = discover.unique_name(candidate, lambda n: bool(cfg.board(n)) or any(e["name"] == n for e in additions))
         port = next_free_port(cfg.server.port_base, taken)
         taken.add(port)
-        rows.append([name, "new", str(port), f"{candidate} ({_count_events(candidate)} event files)"])
+        rows.append([name, "new", str(port), f"{candidate} ({discover.count_events(candidate)} event files)"])
         additions.append({"name": name, "logdir": str(candidate), "port": port,
                           "autostart": args.autostart})
     print(_table(rows, ["name", "status", "port", "logdir"]))
@@ -825,7 +865,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if spec.logdir is not None and not spec.logdir.exists():
             issues.append("logdir missing")
         elif spec.logdir is not None:
-            events = _count_events(spec.logdir)
+            events = discover.count_events(spec.logdir)
             if events == 0:
                 issues.append("no event files found")
         # TensorBoard's data server holds a descriptor per event file; too few and
@@ -950,7 +990,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.set_defaults(func=cmd_serve)
 
     p_add = sub.add_parser("add", help="register a logdir")
-    p_add.add_argument("logdir", nargs="?", help="directory passed to tensorboard --logdir")
+    p_add.add_argument("logdir", nargs="*", help="directory passed to tensorboard --logdir")
     p_add.add_argument("--logdir-spec", help="tensorboard --logdir_spec value instead of a logdir")
     p_add.add_argument("--name")
     p_add.add_argument("--port", type=int)
@@ -965,7 +1005,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.set_defaults(func=cmd_add)
 
     p_rm = sub.add_parser("rm", help="unregister a board")
-    p_rm.add_argument("name")
+    p_rm.add_argument("name", nargs="+", help="board name or its logdir")
     p_rm.set_defaults(func=cmd_rm)
 
     p_set = sub.add_parser("set", help="set board keys, e.g. tensorwatch set cleanrl autostart=on_demand")

@@ -6,7 +6,7 @@ import subprocess
 import pytest
 
 
-def test_dashboard_heartbeat():
+def test_dashboard_behaviour():
     node = shutil.which("node")
     if node is None:
         pytest.skip("Node.js is required for dashboard JavaScript tests")
