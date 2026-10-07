@@ -54,6 +54,8 @@ let framePending = false;
 /** Transient message shown instead of the totals line; survives renders. */
 let notice = null;
 let streamDown = false;
+let heartbeatTimer = null;
+let heartbeatKey = "";
 
 /** name -> HTMLIFrameElement */
 const frames = new Map();
@@ -175,11 +177,13 @@ function select(name) {
   localStorage.setItem(ACTIVE_KEY, name);
   const board = byName(name);
   if (board) {
-    // `demand` starts an on_demand board and keeps its idle timeout; `start`
-    // would pin it running, silently turning it into an always board.
-    const action = board.autostart === "on_demand" || board.state === "running" ? "demand" : "start";
-    act(name, action).catch(action === "demand" ? () => {} : reportError);
+    // The heartbeat starts on_demand boards without pinning them running.
+    // Only explicitly start a stopped board with a different policy.
+    if (board.autostart !== "on_demand" && board.state !== "running") {
+      act(name, "start").catch(reportError);
+    }
   }
+  scheduleHeartbeat(true);
   schedule();
 }
 
@@ -210,6 +214,7 @@ function render() {
   renderQueue();
   renderPanes();
   renderTotals();
+  scheduleHeartbeat();
 }
 
 function renderTotals() {
@@ -751,6 +756,7 @@ function absorb(payload) {
     if (!board) unmount(name);
     else if (board.state !== "running") unmount(name, { keepActive: true });
   }
+  scheduleHeartbeat();
   schedule();
 }
 
@@ -763,12 +769,37 @@ function connect() {
   };
 }
 
-/** Tell the manager a human is watching, so on_demand boards stay up. */
-function heartbeat() {
-  if (document.hidden) return;
-  const names = new Set(lru);
-  if (active) names.add(active);
-  for (const name of names) act(name, "demand").catch(() => {});
+/** Renew watched boards well before their idle lease expires. */
+function scheduleHeartbeat(force = false) {
+  const names = [...new Set([...lru, ...(active ? [active] : [])])]
+    .filter((name) => byName(name));
+  const watched = names.map(byName);
+  const key = document.hidden ? "" : JSON.stringify(
+    watched.map((board) => [board.name, board.autostart, board.idle_timeout]),
+  );
+  // SSE updates and local age renders must not continually postpone renewal.
+  if (!force && key === heartbeatKey && heartbeatTimer !== null) return;
+  clearTimeout(heartbeatTimer);
+  heartbeatTimer = null;
+  heartbeatKey = key;
+  if (document.hidden || !names.length) return;
+
+  let period = 60000;
+  for (const board of watched) {
+    if (board.autostart === "on_demand" && Number.isFinite(board.idle_timeout) && board.idle_timeout > 0) {
+      period = Math.min(period, board.idle_timeout * 1000 / 3);
+    }
+  }
+  // Keep room for delayed callbacks and failed requests without busy-looping
+  // on an accidentally tiny timeout. Hidden windows release their leases.
+  period = Math.max(250, period);
+  const renew = () => {
+    for (const name of names) act(name, "demand").catch(() => {});
+    heartbeatTimer = setTimeout(renew, period);
+  };
+  // Renew immediately when restoring a selection, resuming the window, or
+  // changing the watched set/policy, including newly selected short leases.
+  renew();
 }
 
 /* ------------------------------------------------------------------ events */
@@ -797,6 +828,7 @@ els.reloadConfig.addEventListener("click", () => {
     .catch(reportError);
 });
 document.addEventListener("visibilitychange", () => {
+  scheduleHeartbeat();
   if (!document.hidden) {
     // A frame requested while hidden may never have run; ask for a fresh one.
     framePending = false;
@@ -855,4 +887,3 @@ fetch("/api/state")
 setInterval(() => {
   if (!document.hidden) schedule();
 }, 5000);
-setInterval(heartbeat, 60000);
