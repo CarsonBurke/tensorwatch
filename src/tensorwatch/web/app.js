@@ -39,7 +39,18 @@ const els = {
   addClose: $("add-board-close"),
   addForm: $("add-board-form"),
   addPath: $("add-board-path"),
+  addPaths: $("add-board-paths"),
+  addName: $("add-board-name"),
+  addAutostart: $("add-board-autostart"),
   addError: $("add-board-error"),
+  suggestions: $("suggestions"),
+  suggestionsMeta: $("suggestions-meta"),
+  suggestionsList: $("suggestions-list"),
+  boardsEmpty: $("boards-empty"),
+  placeholderTitle: $("placeholder-title"),
+  placeholderText: $("placeholder-text"),
+  placeholderAdd: $("placeholder-add"),
+  toasts: $("toasts"),
 };
 
 const ACTIVE_KEY = "tensorwatch.active";
@@ -51,9 +62,13 @@ let queueExpanded = false;
 let statusPane = null;
 let statusKey = "";
 let framePending = false;
-/** Transient message shown instead of the totals line; survives renders. */
-let notice = null;
 let streamDown = false;
+/** Static buttons get their icons on the first render, not at load. */
+let chromeReady = false;
+/** A board the user just added; opened as soon as the manager reports it. */
+let pendingSelect = null;
+let heartbeatTimer = null;
+let heartbeatKey = "";
 
 /** name -> HTMLIFrameElement */
 const frames = new Map();
@@ -87,14 +102,16 @@ function fmtAge(since) {
   return `${Math.floor(secs / 86400)}d`;
 }
 
-const byName = (name) => state.boards.find((b) => b.name === name) || null;
+/** name -> board, rebuilt with each state so lookups in render loops stay O(1). */
+let boardIndex = new Map();
+const byName = (name) => boardIndex.get(name) || null;
 const queue = () => state.queue;
 
 /* --------------------------------------------------------------------- api */
 
-async function post(path, body) {
+async function request(method, path, body) {
   const response = await fetch(path, {
-    method: "POST",
+    method,
     headers: body === undefined ? {} : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
@@ -105,15 +122,90 @@ async function post(path, body) {
   return response.json();
 }
 
-const act = (name, action) => post(`/api/boards/${encodeURIComponent(name)}/${action}`);
+const post = (path, body) => request("POST", path, body);
+const boardPath = (name) => `/api/boards/${encodeURIComponent(name)}`;
+const act = (name, action) => post(`${boardPath(name)}/${action}`);
 
-function say(text, ttl = 8000) {
-  notice = { text, until: Date.now() + ttl };
-  schedule();
+/* ------------------------------------------------------------------- icons */
+
+// 24px grid, drawn as strokes so they take the text colour and stay crisp at 13px.
+const ICONS = {
+  play: "M8 5.5v13l10.5-6.5z",
+  stop: "M7 7h10v10H7z",
+  restart: "M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4.6h-4.6",
+  clock: "M12 4.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15zM12 8v4.2l2.8 1.8",
+  log: "M5 7h14M5 12h14M5 17h9",
+  external: "M13.5 5H19v5.5M19 5l-8 8M10 7H6v11h11v-4",
+  trash: "M5 7.5h14M10 7.5V5h4v2.5M7 7.5l.9 11.5h8.2L17 7.5",
+  plus: "M12 5.5v13M5.5 12h13",
+  close: "M6.5 6.5l11 11M17.5 6.5l-11 11",
+};
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+function icon(name) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.classList.add("icon");
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute("d", ICONS[name]);
+  svg.append(path);
+  return svg;
 }
 
+/** Swap a button's icon only when it changes, so renders do not churn the DOM. */
+function setIcon(button, name) {
+  if (button.dataset.icon === name) return;
+  button.dataset.icon = name;
+  button.replaceChildren(icon(name));
+}
+
+function setLabel(button, label) {
+  if (button.title === label) return;
+  button.title = label;
+  button.setAttribute("aria-label", label);
+}
+
+/* ------------------------------------------------------------------ toasts */
+
+/**
+ * A message that outlives the render that caused it, optionally with one action
+ * (undo). Shown over the pane rather than in the sidebar: the sidebar's totals
+ * line should not jump every time something is confirmed.
+ */
+function toast(text, { kind = "info", ttl = 5000, action = null } = {}) {
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  const label = document.createElement("span");
+  label.textContent = text;
+  el.append(label);
+  let timer = null;
+  const dismiss = () => {
+    clearTimeout(timer);
+    el.remove();
+  };
+  if (action) {
+    el.append(textButton(action.label, () => {
+      dismiss();
+      action.run();
+    }));
+  }
+  el.append(iconButton("close", "dismiss", dismiss));
+  el.dataset.kept = action ? "1" : "";
+  els.toasts.append(el);
+  // Keep the stack short, but never drop a pending undo to do it.
+  while (els.toasts.children.length > 4) {
+    const oldest = [...els.toasts.children].find((item) => !item.dataset.kept);
+    if (!oldest) break;
+    oldest.remove();
+  }
+  timer = setTimeout(dismiss, ttl);
+}
+
+const say = (text, ttl = 4000) => toast(text, { ttl });
+
 function reportError(err) {
-  say(`error: ${err && err.message ? err.message : err}`);
+  toast(err && err.message ? err.message : String(err), { kind: "error", ttl: 9000 });
 }
 
 /* ------------------------------------------------------------------- panes */
@@ -175,11 +267,13 @@ function select(name) {
   localStorage.setItem(ACTIVE_KEY, name);
   const board = byName(name);
   if (board) {
-    // `demand` starts an on_demand board and keeps its idle timeout; `start`
-    // would pin it running, silently turning it into an always board.
-    const action = board.autostart === "on_demand" || board.state === "running" ? "demand" : "start";
-    act(name, action).catch(action === "demand" ? () => {} : reportError);
+    // The heartbeat starts on_demand boards without pinning them running.
+    // Only explicitly start a stopped board with a different policy.
+    if (board.autostart !== "on_demand" && board.state !== "running") {
+      act(name, "start").catch(reportError);
+    }
   }
+  scheduleHeartbeat(true);
   schedule();
 }
 
@@ -206,10 +300,16 @@ function schedule() {
 }
 
 function render() {
+  if (!chromeReady) {
+    chromeReady = true;
+    setIcon(els.reloadConfig, "restart");
+    setIcon(els.addBoard, "plus");
+  }
   renderBoards();
   renderQueue();
   renderPanes();
   renderTotals();
+  scheduleHeartbeat();
 }
 
 function renderTotals() {
@@ -217,11 +317,6 @@ function renderTotals() {
     els.totals.textContent = "reconnecting to tensorwatch…";
     return;
   }
-  if (notice && Date.now() < notice.until) {
-    els.totals.textContent = notice.text;
-    return;
-  }
-  notice = null;
   const running = state.boards.filter((b) => b.state === "running");
   const rss = running.reduce((sum, b) => sum + (b.rss_bytes || 0), 0);
   const cpu = running.reduce((sum, b) => sum + (b.cpu_percent || 0), 0);
@@ -271,36 +366,40 @@ function boardRow(board) {
   live.title = "pane mounted";
   const acts = document.createElement("div");
   acts.className = "acts";
-  const power = iconButton("", "start/stop", (event) => {
+  const power = iconButton("play", "start", (event) => {
     event.stopPropagation();
     const board_ = byName(board.name);
     const running = board_ && (board_.state === "running" || board_.state === "starting");
     act(board.name, running ? "stop" : "start").catch(reportError);
   });
-  const demandToggle = iconButton("◷", "on demand", (event) => {
+  const demandToggle = iconButton("clock", "on demand", (event) => {
     event.stopPropagation();
     const board_ = byName(board.name);
     if (!board_) return;
     // Binary by design: "not on demand" means the manager keeps it up.
     const mode = board_.autostart === "on_demand" ? "always" : "on_demand";
-    post(`/api/boards/${encodeURIComponent(board.name)}/autostart`, { mode })
-      .then(() => say(`${board.name}: ${mode === "on_demand" ? "on demand" : "always on"}`, 4000))
+    post(`${boardPath(board.name)}/autostart`, { mode })
+      .then(() => say(`${board.name} now runs ${mode === "on_demand" ? "when opened" : "always"}`))
       .catch(reportError);
   });
   acts.append(
     power,
-    iconButton("↻", "restart", (event) => {
+    iconButton("restart", "restart", (event) => {
       event.stopPropagation();
       act(board.name, "restart").catch(reportError);
     }),
     demandToggle,
-    iconButton("▤", "log tail", (event) => {
+    iconButton("log", "log tail", (event) => {
       event.stopPropagation();
       showLogs(board.name);
     }),
-    iconButton("↗", "open in its own window", (event) => {
+    iconButton("external", "open in its own window", (event) => {
       event.stopPropagation();
       detach(board.name);
+    }),
+    iconButton("trash", "remove from the registry", (event) => {
+      event.stopPropagation();
+      removeBoard(board.name);
     }),
   );
   // Queue activity for this board's project; stays visible on hover because it
@@ -313,14 +412,22 @@ function boardRow(board) {
   const demand = document.createElement("span");
   demand.className = "demand";
   demand.title = "on demand: starts when opened, stops when idle";
+  demand.append(icon("clock"));
   right.append(run, runq, demand, idx, live, acts);
 
   el.append(dot, body, right);
   el.addEventListener("click", () => select(board.name));
   el.addEventListener("keydown", (event) => {
+    if (event.target !== el) return;  // a key on one of the row's own buttons
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       select(board.name);
+    } else if (event.key === "Delete") {
+      event.preventDefault();
+      removeBoard(board.name);
+    } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      focusNeighbour(el, event.key === "ArrowDown" ? 1 : -1);
     }
   });
   els.boards.appendChild(el);
@@ -330,12 +437,30 @@ function boardRow(board) {
   return row;
 }
 
-function iconButton(glyph, title, handler) {
+function iconButton(name, label, handler) {
   const button = document.createElement("button");
-  button.textContent = glyph;
-  button.title = title;
+  button.type = "button";
+  setIcon(button, name);
+  setLabel(button, label);
   button.addEventListener("click", handler);
   return button;
+}
+
+/** Move focus to the next visible board row; the list is short, so no roving index. */
+function focusNeighbour(el, step) {
+  const rows = [...els.boards.children].filter((row) => !row.classList.contains("hidden"));
+  const next = rows[rows.indexOf(el) + step];
+  if (next) next.focus();
+  return Boolean(next);
+}
+
+/** What a board is doing, in the few words a row has room for. */
+function shortStatus(board) {
+  if (board.state === "stopped" && board.autostart === "on_demand") return "on demand";
+  const message = board.message || "";
+  if (message.startsWith("logdir does not exist")) return "logdir missing";
+  if (board.state === "failed" || board.state === "backoff") return message || board.state;
+  return board.state;
 }
 
 /** board name -> {running: QueueJob[], queued: QueueJob[]} from the mlq snapshot. */
@@ -417,9 +542,7 @@ function renderBoards() {
       if (board.rss_bytes) bits.push(fmtBytes(board.rss_bytes));
       if (board.cpu_percent) bits.push(`${board.cpu_percent}%`);
     } else {
-      bits.push(board.state === "stopped" && board.autostart === "on_demand"
-        ? "on demand"
-        : board.message || board.state);
+      bits.push(shortStatus(board));
     }
     const meta = bits.join(" · ");
     const running = board.state === "running" || board.state === "starting";
@@ -453,13 +576,16 @@ function renderBoards() {
       `${board.target}\n${board.message || board.state}` + (mark.title ? `\n${mark.title}` : "");
     row.el.setAttribute("aria-selected", board.name === active ? "true" : "false");
     row.idx.textContent = number && number <= 10 ? (number === 10 ? "0" : String(number)) : "";
-    row.power.textContent = running ? "■" : "▶";
-    row.power.title = running ? "stop" : "start";
-    row.demand.textContent = onDemand ? "◷" : "";
+    setIcon(row.power, running ? "stop" : "play");
+    setLabel(row.power, running ? "stop" : "start");
+    row.demand.hidden = !onDemand;
     row.demandToggle.className = onDemand ? "on" : "";
-    row.demandToggle.title = onDemand
-      ? "on demand — click to keep this board always running"
-      : "click to serve on demand: start when opened, stop when idle";
+    setLabel(
+      row.demandToggle,
+      onDemand
+        ? "runs when opened — click to keep it always running"
+        : "always running — click to run it only when opened",
+    );
     // Keep DOM order in sync with registry order without rebuilding rows.
     const expected = els.boards.children[index];
     if (expected !== row.el) els.boards.insertBefore(row.el, expected || null);
@@ -471,6 +597,12 @@ function renderBoards() {
       boardRows.delete(name);
     }
   }
+
+  const empty = !state.boards.length
+    ? "No boards yet."
+    : shown ? "" : `No board matches “${els.filter.value.trim()}”.`;
+  els.boardsEmpty.hidden = !empty;
+  els.boardsEmpty.textContent = empty;
 }
 
 /* ------------------------------------------------------------------- queue */
@@ -548,7 +680,7 @@ function renderQueue() {
       row.when.textContent = when;
       row.el.className = `job ${job.state}${tag ? " linked" : ""}`;
       row.kill.hidden = !snapshot.connected;
-      row.kill.title = running ? `kill #${job.id} ${job.name}` : `cancel #${job.id} ${job.name}`;
+      setLabel(row.kill, running ? `kill #${job.id} ${job.name}` : `cancel #${job.id} ${job.name}`);
       row.el.title =
         `#${job.id} ${job.name}\n${job.state}${job.reason ? ` (${job.reason})` : ""}\n${job.cwd}` +
         (boards.length ? `\nboards: ${boards.join(", ")}\nclick to open ${tag}` : "");
@@ -587,14 +719,14 @@ function jobRow(job) {
   label.append(name, meta);
   const when = document.createElement("span");
   when.className = "when";
-  const kill = iconButton("×", "cancel", (event) => {
+  const kill = iconButton("close", "cancel", (event) => {
     event.stopPropagation();
     const current = [...(queue()?.running || []), ...(queue()?.queued || [])]
       .find((candidate) => candidate.id === job.id);
     if (!current) return;
     const verb = current.state === "running" ? "kill" : "cancel";
     post(`/api/queue/${current.id}/cancel`)
-      .then(() => say(`${verb} #${current.id} ${current.name}`, 4000))
+      .then(() => say(`${verb === "kill" ? "Killed" : "Cancelled"} #${current.id} ${current.name}`))
       .catch(reportError);
   });
   kill.className = "kill";
@@ -627,6 +759,12 @@ function renderPanes() {
     return;
   }
   els.placeholder.hidden = Boolean(board);
+  const none = !state.boards.length;
+  els.placeholderTitle.textContent = none ? "No boards yet" : "Nothing open";
+  els.placeholderText.textContent = none
+    ? "Register a TensorBoard logdir and it is kept running, on its own port, from here on."
+    : "Pick a board on the left. Only the last couple you viewed stay loaded.";
+  els.placeholderAdd.hidden = !none;
   if (board) {
     showStatusPane(board);
   } else if (statusPane) {
@@ -649,13 +787,19 @@ function showStatusPane(board) {
   statusPane.replaceChildren();
 
   const title = document.createElement("h2");
-  title.textContent = `${board.name} — ${board.state}`;
+  const chip = document.createElement("span");
+  chip.className = `chip state-${board.state}`;
+  chip.textContent = board.state;
+  title.append(board.name, chip);
   const target = document.createElement("div");
   target.className = "muted";
   target.textContent = `${board.target} · port ${board.port} · autostart ${board.autostart}`;
   const message = document.createElement("p");
   message.className = "muted";
-  message.textContent = board.message || "";
+  const missing = (board.message || "").startsWith("logdir does not exist");
+  message.textContent = missing
+    ? "Its logdir does not exist. Remove the board if the runs are gone for good."
+    : board.message || "";
 
   const row = document.createElement("div");
   row.className = "row";
@@ -667,10 +811,12 @@ function showStatusPane(board) {
     textButton("restart", () => act(board.name, "restart").catch(reportError)),
     textButton("log tail", () => showLogs(board.name)),
     textButton("open in new window", () => detach(board.name)),
+    textButton("remove", () => removeBoard(board.name)),
   );
   statusPane.append(title, target, message, row);
 
-  if (!starting) {
+  // A board that never started has no log worth showing.
+  if (!starting && !missing) {
     const pre = document.createElement("pre");
     pre.textContent = "loading log tail…";
     statusPane.append(pre);
@@ -686,6 +832,7 @@ function showStatusPane(board) {
 
 function textButton(label, handler) {
   const button = document.createElement("button");
+  button.type = "button";
   button.textContent = label;
   button.addEventListener("click", handler);
   return button;
@@ -694,7 +841,7 @@ function textButton(label, handler) {
 /* -------------------------------------------------------------------- logs */
 
 async function fetchLogs(name, lines) {
-  const response = await fetch(`/api/boards/${encodeURIComponent(name)}/logs?lines=${lines}`);
+  const response = await fetch(`${boardPath(name)}/logs?lines=${lines}`);
   if (!response.ok) throw new Error(`log fetch failed: ${response.status}`);
   return response.text();
 }
@@ -711,28 +858,247 @@ async function showLogs(name) {
   els.logsBody.scrollTop = els.logsBody.scrollHeight;
 }
 
-/* ----------------------------------------------------------------- add board */
+/* ------------------------------------------------------- add / remove board */
+
+/**
+ * Unregister a board. No confirmation: the registry block is handed back by the
+ * server and "Undo" puts it where it was, port and comments included.
+ */
+async function removeBoard(name) {
+  const wasActive = active === name;
+  // Keep the keyboard in the list: the row about to go has the focus.
+  const row = boardRows.get(name);
+  if (row && document.activeElement === row.el) {
+    focusNeighbour(row.el, 1) || focusNeighbour(row.el, -1);
+  }
+  try {
+    const { undo } = await request("DELETE", boardPath(name));
+    toast(`Removed ${name}`, {
+      ttl: 12000,
+      action: {
+        label: "Undo",
+        run: () =>
+          post("/api/boards", { undo })
+            .then((result) => {
+              if (wasActive && !active) pendingSelect = result.board;
+              say(`Restored ${result.board}`);
+            })
+            .catch(reportError),
+      },
+    });
+  } catch (err) {
+    reportError(err);
+  }
+}
+
+/** Completion state for the logdir field. */
+const paths = { items: [], index: -1, seq: 0, timer: null };
+let suggestSeq = 0;
+/** One add at a time: a held Enter must not register the logdir twice. */
+let submitting = false;
 
 function showAddBoard() {
-  els.addPath.value = "";
-  els.addError.hidden = true;
-  els.addError.textContent = "";
+  els.addForm.reset();
+  showAddError("");
+  renderPaths([]);
   els.addDialog.showModal();
   els.addPath.focus();
+  loadSuggestions();
+}
+
+function showAddError(message) {
+  els.addError.textContent = message;
+  els.addError.hidden = !message;
+}
+
+/** Ask for directories matching what is typed; only the latest answer is shown. */
+function completePaths() {
+  clearTimeout(paths.timer);
+  const prefix = els.addPath.value;
+  if (!prefix.trim()) {
+    paths.seq += 1;
+    renderPaths([]);
+    return;
+  }
+  // Numbered when typed, not when asked: an answer to the previous keystroke
+  // must not show up during this one's debounce.
+  const seq = ++paths.seq;
+  paths.timer = setTimeout(async () => {
+    let items = [];
+    try {
+      const response = await fetch(`/api/paths?prefix=${encodeURIComponent(prefix)}`);
+      items = response.ok ? (await response.json()).paths || [] : [];
+    } catch {
+      // The field still works as a plain text input.
+    }
+    if (seq === paths.seq) renderPaths(items);
+  }, 70);
+}
+
+function renderPaths(items) {
+  paths.items = items;
+  paths.index = -1;
+  els.addPaths.hidden = !items.length;
+  els.addPath.setAttribute("aria-expanded", String(Boolean(items.length)));
+  els.addPath.removeAttribute("aria-activedescendant");
+  els.addPaths.replaceChildren(...items.map((item, index) => {
+    const li = document.createElement("li");
+    li.id = `add-board-path-${index}`;
+    li.setAttribute("role", "option");
+    const cut = item.path.lastIndexOf("/") + 1;
+    const parent = document.createElement("span");
+    parent.className = "parent";
+    parent.textContent = item.path.slice(0, cut);
+    const leaf = document.createElement("span");
+    leaf.className = "leaf";
+    leaf.textContent = item.path.slice(cut);
+    li.append(parent, leaf);
+    if (item.events) {
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = "has runs";
+      li.append(tag);
+    }
+    // mousedown, not click: the input must not lose focus to the list.
+    li.addEventListener("mousedown", (event) => {
+      event.preventDefault();
+      acceptPath(index);
+    });
+    return li;
+  }));
+}
+
+function highlightPath(index) {
+  const count = paths.items.length;
+  if (!count) return;
+  paths.index = (index + count) % count;
+  [...els.addPaths.children].forEach((li, at) => {
+    li.classList.toggle("on", at === paths.index);
+    li.setAttribute("aria-selected", String(at === paths.index));
+  });
+  const li = els.addPaths.children[paths.index];
+  els.addPath.setAttribute("aria-activedescendant", li.id);
+  li.scrollIntoView({ block: "nearest" });
+}
+
+/** Take a completion and keep going: the trailing slash lists what is inside. */
+function acceptPath(index) {
+  const item = paths.items[index];
+  if (!item) return;
+  els.addPath.value = `${item.path}/`;
+  completePaths();
+}
+
+function onPathKey(event) {
+  const open = paths.items.length > 0;
+  if (event.key === "ArrowDown" && open) {
+    event.preventDefault();
+    highlightPath(paths.index + 1);
+  } else if (event.key === "ArrowUp" && open) {
+    event.preventDefault();
+    highlightPath(paths.index - 1);
+  } else if (event.key === "Tab" && open && !event.shiftKey) {
+    event.preventDefault();
+    acceptPath(Math.max(0, paths.index));
+  } else if (event.key === "Enter" && open && paths.index >= 0) {
+    event.preventDefault();
+    acceptPath(paths.index);
+  } else if (event.key === "Escape" && open) {
+    // First Escape closes the list; the next one closes the dialog.
+    event.preventDefault();
+    paths.seq += 1;
+    renderPaths([]);
+  }
+}
+
+async function loadSuggestions() {
+  const seq = ++suggestSeq;
+  els.suggestions.hidden = false;
+  els.suggestionsMeta.textContent = "looking…";
+  els.suggestionsList.replaceChildren();
+  let items = [];
+  try {
+    const response = await fetch("/api/suggestions");
+    items = response.ok ? (await response.json()).suggestions || [] : [];
+  } catch {
+    // Suggestions are a convenience; the form does not depend on them.
+  }
+  if (seq !== suggestSeq) return;
+  els.suggestionsList.replaceChildren(...items.map(suggestionRow));
+  countSuggestions();
+}
+
+function countSuggestions() {
+  const count = els.suggestionsList.children.length;
+  els.suggestions.hidden = !count;
+  els.suggestionsMeta.textContent = String(count);
+}
+
+function suggestionRow(item) {
+  const li = document.createElement("li");
+  const body = document.createElement("button");
+  body.type = "button";
+  body.className = "pick";
+  body.title = "fill the form with this logdir";
+  const name = document.createElement("span");
+  name.className = "name";
+  name.textContent = item.name;
+  const meta = document.createElement("span");
+  meta.className = "meta";
+  const where = document.createElement("span");
+  where.className = "where";
+  // The left-to-right mark keeps "~/" in front while the box clips from the left.
+  where.textContent = `\u200e${item.path}`;
+  const files = document.createElement("span");
+  files.textContent = `${item.events >= 1000 ? "1000+" : item.events} event file${item.events === 1 ? "" : "s"}`;
+  meta.append(where, files);
+  body.append(name, meta);
+  body.addEventListener("click", () => {
+    els.addPath.value = item.path;
+    els.addName.value = item.name;
+    renderPaths([]);
+    els.addPath.focus();
+  });
+  const add = textButton("Add", async () => {
+    add.disabled = true;
+    try {
+      const result = await post("/api/boards", {
+        path: item.path,
+        name: item.name,
+        autostart: els.addAutostart.value,
+      });
+      li.remove();
+      countSuggestions();
+      // Said in the dialog: a toast would sit underneath it.
+      showAddError("");
+      els.suggestionsMeta.textContent = `added ${result.board}`;
+    } catch (err) {
+      add.disabled = false;
+      showAddError(err && err.message ? err.message : String(err));
+    }
+  });
+  li.append(body, add);
+  return li;
 }
 
 async function submitAddBoard(event) {
   event.preventDefault();
   const path = els.addPath.value.trim();
-  if (!path) return;
+  if (!path || submitting) return;
+  submitting = true;
   try {
-    const result = await post("/api/boards", { path });
+    const result = await post("/api/boards", {
+      path,
+      name: els.addName.value.trim(),
+      autostart: els.addAutostart.value,
+    });
     els.addDialog.close();
-    say(`registered ${result.board}`, 4000);
+    pendingSelect = result.board;
+    say(result.events ? `Added ${result.board}` : `Added ${result.board} — no event files there yet`);
   } catch (err) {
-    els.addError.textContent = err && err.message ? err.message : String(err);
-    els.addError.hidden = false;
-    reportError(err);
+    showAddError(err && err.message ? err.message : String(err));
+  } finally {
+    submitting = false;
   }
 }
 
@@ -740,7 +1106,13 @@ async function submitAddBoard(event) {
 
 function absorb(payload) {
   state = payload;
+  boardIndex = new Map(state.boards.map((board) => [board.name, board]));
   streamDown = false;
+  if (pendingSelect && byName(pendingSelect)) {
+    const name = pendingSelect;
+    pendingSelect = null;
+    select(name);
+  }
   if (active && !byName(active)) {
     active = null;
     localStorage.removeItem(ACTIVE_KEY);
@@ -751,6 +1123,7 @@ function absorb(payload) {
     if (!board) unmount(name);
     else if (board.state !== "running") unmount(name, { keepActive: true });
   }
+  scheduleHeartbeat();
   schedule();
 }
 
@@ -763,12 +1136,37 @@ function connect() {
   };
 }
 
-/** Tell the manager a human is watching, so on_demand boards stay up. */
-function heartbeat() {
-  if (document.hidden) return;
-  const names = new Set(lru);
-  if (active) names.add(active);
-  for (const name of names) act(name, "demand").catch(() => {});
+/** Renew watched boards well before their idle lease expires. */
+function scheduleHeartbeat(force = false) {
+  const names = [...new Set([...lru, ...(active ? [active] : [])])]
+    .filter((name) => byName(name));
+  const watched = names.map(byName);
+  const key = document.hidden ? "" : JSON.stringify(
+    watched.map((board) => [board.name, board.autostart, board.idle_timeout]),
+  );
+  // SSE updates and local age renders must not continually postpone renewal.
+  if (!force && key === heartbeatKey && heartbeatTimer !== null) return;
+  clearTimeout(heartbeatTimer);
+  heartbeatTimer = null;
+  heartbeatKey = key;
+  if (document.hidden || !names.length) return;
+
+  let period = 60000;
+  for (const board of watched) {
+    if (board.autostart === "on_demand" && Number.isFinite(board.idle_timeout) && board.idle_timeout > 0) {
+      period = Math.min(period, board.idle_timeout * 1000 / 3);
+    }
+  }
+  // Keep room for delayed callbacks and failed requests without busy-looping
+  // on an accidentally tiny timeout. Hidden windows release their leases.
+  period = Math.max(250, period);
+  const renew = () => {
+    for (const name of names) act(name, "demand").catch(() => {});
+    heartbeatTimer = setTimeout(renew, period);
+  };
+  // Renew immediately when restoring a selection, resuming the window, or
+  // changing the watched set/policy, including newly selected short leases.
+  renew();
 }
 
 /* ------------------------------------------------------------------ events */
@@ -776,13 +1174,28 @@ function heartbeat() {
 els.filter.addEventListener("input", schedule);
 els.logsClose.addEventListener("click", () => els.logs.close());
 // The opener lives in a hover-only action row, so the UA cannot restore focus.
-els.logs.addEventListener("close", () => els.filter.focus());
+// It goes to a board row, never to the filter: a text field would swallow the
+// next shortcut.
+const restoreFocus = () => {
+  const row = boardRows.get(active) || boardRows.values().next().value;
+  if (row) row.el.focus();
+  else document.activeElement?.blur();
+};
+els.logs.addEventListener("close", restoreFocus);
 els.addBoard.addEventListener("click", showAddBoard);
+els.placeholderAdd.addEventListener("click", showAddBoard);
+els.addPath.addEventListener("input", completePaths);
+els.addPath.addEventListener("keydown", onPathKey);
+els.addPath.addEventListener("blur", () => {
+  paths.seq += 1;  // an answer still in flight must not reopen the list
+  clearTimeout(paths.timer);
+  renderPaths([]);
+});
 els.addClose.addEventListener("click", () => els.addDialog.close());
 els.addForm.addEventListener("submit", (event) => {
   submitAddBoard(event);
 });
-els.addDialog.addEventListener("close", () => els.filter.focus());
+els.addDialog.addEventListener("close", restoreFocus);
 els.queueMore.addEventListener("click", () => {
   queueExpanded = !queueExpanded;
   schedule();
@@ -793,10 +1206,11 @@ els.queueHead.addEventListener("click", () => {
 });
 els.reloadConfig.addEventListener("click", () => {
   post("/api/reload")
-    .then(() => say("registry reloaded", 4000))
+    .then(() => say("Registry reloaded"))
     .catch(reportError);
 });
 document.addEventListener("visibilitychange", () => {
+  scheduleHeartbeat();
   if (!document.hidden) {
     // A frame requested while hidden may never have run; ask for a fresh one.
     framePending = false;
@@ -839,6 +1253,10 @@ document.addEventListener("keydown", (event) => {
     els.queueHead.click();
     return;
   }
+  if (event.key === "r") {
+    els.reloadConfig.click();
+    return;
+  }
   if (!active) return;
   if (event.key === "w") unmount(active);
   else if (event.key === "d") detach(active);
@@ -855,4 +1273,3 @@ fetch("/api/state")
 setInterval(() => {
   if (!document.hidden) schedule();
 }, 5000);
-setInterval(heartbeat, 60000);

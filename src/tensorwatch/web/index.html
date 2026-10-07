@@ -3,6 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
     <title>TensorWatch</title>
     <link rel="icon" href="/static/icon-32.png" type="image/png" sizes="32x32" />
     <link rel="icon" href="/static/icon-256.png" type="image/png" sizes="256x256" />
@@ -16,7 +17,7 @@
         <div class="brand">
           <img src="/static/icon.svg" alt="" width="18" height="18" />
           <h1>TensorWatch</h1>
-          <button id="reload-config" class="ghost" title="Re-read the registry file (r)">&#8635;</button>
+          <button id="reload-config" class="ghost" title="Re-read the registry file (r)" aria-label="Reload registry"></button>
         </div>
         <div id="totals" class="totals">connecting&hellip;</div>
         <input id="filter" type="search" placeholder="filter boards  /" autocomplete="off" spellcheck="false" />
@@ -26,11 +27,12 @@
         <div class="section-head">
           <span class="section-label">
             Boards
-            <button id="add-board" class="ghost" title="Register a logdir" aria-label="Add board">+</button>
+            <button id="add-board" class="ghost" title="Add a board (+)" aria-label="Add board"></button>
           </span>
           <span id="boards-count"></span>
         </div>
         <nav id="boards" role="listbox" aria-label="Registered boards"></nav>
+        <p id="boards-empty" class="empty" hidden></p>
       </div>
 
       <section id="queue" hidden>
@@ -48,23 +50,25 @@
     <main id="main">
       <section id="panes">
         <div id="placeholder" class="pane card">
-          <h2>Nothing open</h2>
-          <p class="muted">
-            Pick a board on the left. Panes mount on first view and the least recently
-            used ones are dropped, so only a couple of TensorBoard front-ends stay
-            resident.
+          <h2 id="placeholder-title">Nothing open</h2>
+          <p id="placeholder-text" class="muted">
+            Pick a board on the left. Only the last couple you viewed stay loaded.
           </p>
+          <div class="row"><button id="placeholder-add">Add a board</button></div>
           <ul class="keys">
             <li><kbd>1</kbd>&ndash;<kbd>9</kbd> switch board, <kbd>Ctrl</kbd>+<kbd>1</kbd>&ndash;<kbd>0</kbd> for 1–10</li>
             <li><kbd>/</kbd> filter</li>
             <li><kbd>+</kbd> add a board</li>
+            <li><kbd>Delete</kbd> remove the focused board</li>
             <li><kbd>w</kbd> close the open pane</li>
             <li><kbd>d</kbd> detach into its own window</li>
             <li><kbd>Shift</kbd>+<kbd>R</kbd> reload the pane</li>
             <li><kbd>Enter</kbd> open the focused board</li>
             <li><kbd>q</kbd> collapse the queue</li>
+            <li><kbd>r</kbd> re-read the registry file</li>
           </ul>
         </div>
+        <div id="toasts" role="status" aria-live="polite"></div>
       </section>
     </main>
 
@@ -81,13 +85,36 @@
       <form id="add-board-form">
         <label class="field">
           <span>Logdir</span>
-          <input id="add-board-path" type="text" name="path" placeholder="~/path/to/runs" autocomplete="off" spellcheck="false" required />
+          <input
+            id="add-board-path" type="text" name="path" placeholder="~/path/to/runs"
+            autocomplete="off" spellcheck="false" required
+            role="combobox" aria-autocomplete="list" aria-controls="add-board-paths" aria-expanded="false"
+          />
         </label>
-        <p id="add-board-error" class="add-error" hidden></p>
+        <ul id="add-board-paths" class="paths" role="listbox" aria-label="Matching directories" hidden></ul>
+        <div class="field-row">
+          <label class="field">
+            <span>Name</span>
+            <input id="add-board-name" type="text" name="name" placeholder="from the path" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="field">
+            <span>Runs</span>
+            <select id="add-board-autostart" name="autostart">
+              <option value="always">always</option>
+              <option value="on_demand">when opened</option>
+              <option value="manual">when started by hand</option>
+            </select>
+          </label>
+        </div>
+        <p id="add-board-error" class="add-error" role="alert" hidden></p>
         <div class="row">
-          <button type="submit">Add</button>
+          <button type="submit" class="primary">Add board</button>
         </div>
       </form>
+      <section id="suggestions" hidden>
+        <div class="section-head"><span>Found near your boards</span><span id="suggestions-meta"></span></div>
+        <ul id="suggestions-list"></ul>
+      </section>
     </dialog>
 
     <script src="/static/app.js"></script>

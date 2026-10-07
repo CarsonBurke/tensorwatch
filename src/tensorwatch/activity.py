@@ -55,43 +55,45 @@ def touch(hint: Path | None) -> float | None:
 
 def scan(root: Path, cap: int = DEFAULT_CAP) -> Activity:
     """Walk ``root`` for the newest event file, visiting at most ``cap`` entries."""
-    newest: Path | None = None
+    newest: str | None = None
     newest_mtime: float | None = None
     files = 0
     visited = 0
     truncated = False
-    stack: list[Path] = [root]
+    # Plain strings: a tree with thousands of runs would otherwise build a Path
+    # per directory just to hand it straight back to scandir.
+    stack: list[str] = [os.fspath(root)]
 
     while stack:
-        directory = stack.pop()
         try:
-            with os.scandir(directory) as entries:
+            with os.scandir(stack.pop()) as entries:
                 for entry in entries:
                     visited += 1
                     if visited > cap:
                         truncated = True
                         stack.clear()
                         break
-                    if entry.name.startswith(EVENT_PREFIX):
+                    name = entry.name
+                    if name.startswith(EVENT_PREFIX):
                         files += 1
                         try:
                             mtime = entry.stat().st_mtime
                         except OSError:
                             continue
                         if newest_mtime is None or mtime > newest_mtime:
-                            newest_mtime, newest = mtime, Path(entry.path)
+                            newest_mtime, newest = mtime, entry.path
                     elif (
-                        entry.is_dir(follow_symlinks=False)
-                        and not entry.name.startswith(".")
-                        and entry.name not in SKIP_DIRS
+                        name[0] != "."
+                        and name not in SKIP_DIRS
+                        and entry.is_dir(follow_symlinks=False)
                     ):
-                        stack.append(Path(entry.path))
+                        stack.append(entry.path)
         except OSError:
             continue
 
     return Activity(
         mtime=newest_mtime,
-        newest=newest,
+        newest=Path(newest) if newest is not None else None,
         files=files,
         truncated=truncated,
         scanned_at=time.time(),
