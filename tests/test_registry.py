@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from tensorwatch import config, registry
@@ -255,7 +257,7 @@ def test_boards_removed_in_any_order_come_back_in_any_order_when_told_what_follo
             for name in undo:
                 # As RegistryOps does: what follows is read off the original order.
                 after = tuple("abc"["abc".index(name) + 1 :])
-                text = registry.insert(text, registry.Taken(cut[name].chunk, cut[name].line, after))
+                text = registry.insert(text, replace(cut[name], following=after))
             parsed = config.parse(text)
             assert [board.name for board in parsed.boards] == ["a", "b", "c"], (removal, undo)
             # Nothing was spliced into the [defaults] table that trails the boards.
@@ -269,12 +271,20 @@ def test_a_stale_line_inside_another_table_is_not_trusted():
     inside_board = without.splitlines().index('logdir = "/a"')
     for stale in (inside_defaults, inside_board, 1, 10_000, -1):
         restored = registry.insert(
-            without, registry.Taken(taken.chunk, stale, taken.following)
+            without + "\n", replace(taken, line=stale)
         )
         parsed = config.parse(restored)
         assert [board.name for board in parsed.boards] == ["a", "b", "c"], stale
         assert [board.autostart for board in parsed.boards] == ["manual"] * 3, stale
         assert parsed.boards[1].env == {"X": "1"}
+
+
+def test_undo_keeps_a_subtable_added_to_the_previous_board():
+    text = '[[board]]\nname = "a"\nlogdir = "/a"\n\n[[board]]\nname = "b"\nlogdir = "/b"\n'
+    without, taken = registry.take(text, "b")
+    updated = without + '[board.env]\nTAG = "belongs-to-a"\n'
+    restored = config.parse(registry.insert(updated, taken))
+    assert [board.env for board in restored.boards] == [{"TAG": "belongs-to-a"}, {}]
 
 
 def test_insert_only_accepts_one_free_board_block():
@@ -284,4 +294,4 @@ def test_insert_only_accepts_one_free_board_block():
     chunk = taken.chunk
     for junk in (chunk + "[server]\nport = 1\n", "port = 1\n" + chunk, chunk + chunk, "nonsense"):
         with pytest.raises(registry.RegistryError, match="exactly one"):
-            registry.insert(without, registry.Taken(junk, taken.line, taken.following))
+            registry.insert(without, replace(taken, chunk=junk))

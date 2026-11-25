@@ -203,7 +203,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         supervisor,
         cfg.server.host,
         cfg.server.port,
-        do_reload,
+        ops.reload,
         do_cancel if cfg.queue.enabled else None,
         ops.add,
         ops.autostart,
@@ -232,7 +232,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         if reload_requested.is_set():
             reload_requested.clear()
             try:
-                do_reload()
+                ops.reload()
                 print("registry reloaded")
             except ConfigError as exc:
                 print(f"tensorwatch: reload failed: {exc}", file=sys.stderr)
@@ -539,6 +539,10 @@ class RegistryOps:
         with self._lock:
             self._generation += 1
             self._suggested = None
+
+    def reload(self) -> None:
+        with self._lock:
+            self._reload()
 
 
 def cmd_add(args: argparse.Namespace) -> int:

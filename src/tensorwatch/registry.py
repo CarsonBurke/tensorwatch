@@ -14,6 +14,7 @@ import re
 import tempfile
 import tomllib
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -122,11 +123,11 @@ def _name_of(data: Mapping[str, Any]) -> str:
     return ""
 
 
-def _find(text: str, name: str) -> Block:
-    for block in blocks(text):
+def _find(found: list[Block], name: str) -> Block:
+    for block in found:
         if block.name == name:
             return block
-    known = ", ".join(b.name for b in blocks(text)) or "<none>"
+    known = ", ".join(block.name for block in found) or "<none>"
     raise RegistryError(f"no board named {name!r} (registered: {known})")
 
 
@@ -197,32 +198,31 @@ class Taken:
     line: int
     #: Boards that came after it, nearest first.
     following: tuple[str, ...]
+    #: Contents immediately after removal, used to validate the original line.
+    remaining_digest: bytes
 
 
 def take(text: str, name: str) -> tuple[str, Taken]:
     """Cut board ``name`` out; return the new text and what was taken."""
     found = blocks(text)
-    block = _find(text, name)
+    block = _find(found, name)
     lines = text.splitlines(keepends=True)
     end = block.end
     # Swallow the blank separator that followed the block, if any.
     if end < len(lines) and not lines[end].strip():
         end += 1
+    remaining = "".join(lines[: block.start] + lines[end:])
     taken = Taken(
         chunk="".join(lines[block.start : end]),
         line=block.start,
         following=tuple(other.name for other in found if other.start > block.start),
+        remaining_digest=sha256(remaining.encode()).digest(),
     )
-    return "".join(lines[: block.start] + lines[end:]), taken
+    return remaining, taken
 
 
 def remove(text: str, name: str) -> str:
     return take(text, name)[0]
-
-
-def _is_key_line(line: str) -> bool:
-    stripped = line.strip()
-    return bool(stripped) and not stripped.startswith(("#", "["))
 
 
 def insert(text: str, taken: Taken) -> str:
@@ -245,24 +245,14 @@ def insert(text: str, taken: Taken) -> str:
     if any(block.name == name for block in found):
         raise RegistryError(f"board {name!r} already registered")
     lines = text.splitlines(keepends=True)
+    if sha256(text.encode()).digest() == taken.remaining_digest:
+        return "".join(lines[: taken.line]) + taken.chunk + "".join(lines[taken.line :])
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
 
     successor = next(
         (block for wanted in taken.following for block in found if block.name == wanted), None
     )
-    at = taken.line
-    if 0 <= at <= len(lines):
-        # The original line is only trusted if nothing moved around it: the next
-        # board from there must be the one that used to follow, and no key of
-        # some other table may sit in between for the restored block to capture.
-        ahead = next(
-            (i for i in range(at, len(lines)) if lines[i].lstrip().startswith(_TABLE_START)),
-            len(lines),
-        )
-        next_board = next((block for block in found if block.start >= at), None)
-        if next_board is successor and not any(_is_key_line(line) for line in lines[at:ahead]):
-            return "".join(lines[:at]) + chunk + "".join(lines[at:])
     if successor is not None:
         separator = "" if chunk.endswith("\n\n") else "\n"
         return (
@@ -293,7 +283,7 @@ def _key_lines(lines: list[str], block: Block) -> dict[str, int]:
 
 def set_key(text: str, name: str, key: str, value: Any) -> str:
     """Set (or insert) ``key`` inside board ``name``."""
-    block = _find(text, name)
+    block = _find(blocks(text), name)
     lines = text.splitlines(keepends=True)
     rendered = f"{key} = {render_value(value)}\n"
     index = _key_lines(lines, block).get(key)
@@ -305,7 +295,7 @@ def set_key(text: str, name: str, key: str, value: Any) -> str:
 
 
 def unset_key(text: str, name: str, key: str) -> str:
-    block = _find(text, name)
+    block = _find(blocks(text), name)
     lines = text.splitlines(keepends=True)
     index = _key_lines(lines, block).get(key)
     if index is not None:
