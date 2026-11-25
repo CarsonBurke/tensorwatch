@@ -389,3 +389,181 @@ def test_state_carries_the_queue_snapshot(stack):
     assert payload["queue"]["connected"] is True
     assert payload["queue"]["running"][0]["board"] == "fake"
     assert payload["server"]["queue_visible"] == 5
+
+
+@pytest.fixture
+def registry_stack(home, tmp_path):
+    """A manager whose registry lives on disk, wired the way `serve` wires it."""
+    path = tmp_path / "config.toml"
+    supervisor = Supervisor(
+        Config(
+            server=ServerSpec(port=0, poll_interval=0.1, start_stagger=0.0),
+            boards=(),
+            path=path,
+        )
+    )
+    supervisor.start()
+    ops = cli.RegistryOps(path, lambda: supervisor.reload(load(path)), lambda: load(path))
+    server = httpd.serve(
+        supervisor,
+        "127.0.0.1",
+        0,
+        on_add=lambda logdir, **options: ops.add(logdir, autostart="manual", **options),
+        on_remove=ops.remove,
+        on_restore=ops.restore,
+        on_complete=lambda prefix: [{"path": prefix + "x", "events": False}],
+        on_suggest=lambda: [{"path": "/s", "name": "s", "events": 1}],
+    )
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        yield base, tmp_path
+    finally:
+        server.shutdown()
+        server.server_close()
+        supervisor.shutdown()
+
+
+def call(url: str, method: str = "GET", data=None, headers: dict[str, str] = {}):
+    """Like fetch, but an HTTP error is an answer rather than an exception."""
+    try:
+        status, _, body = fetch(url, method=method, data=data, headers=headers)
+    except urllib.error.HTTPError as exc:
+        status, body = exc.code, exc.read()
+    return status, json.loads(body)
+
+
+def add_three(base: str, tmp_path) -> None:
+    for name in ("a", "b", "c"):
+        (tmp_path / name / "runs").mkdir(parents=True)
+        assert call(f"{base}/api/boards", "POST", {"path": str(tmp_path / name / "runs")})[0] == 200
+
+
+def test_add_takes_a_name_and_rejects_bad_fields(registry_stack):
+    base, tmp_path = registry_stack
+    (tmp_path / "proj" / "runs").mkdir(parents=True)
+    status, payload = call(
+        f"{base}/api/boards", "POST", {"path": str(tmp_path / "proj" / "runs"), "name": "mine"}
+    )
+    assert (status, payload["board"], payload["events"]) == (200, "mine", False)
+
+    # Blank optional fields are what an untouched form sends.
+    (tmp_path / "other" / "runs").mkdir(parents=True)
+    status, payload = call(
+        f"{base}/api/boards", "POST",
+        {"path": str(tmp_path / "other" / "runs"), "name": "", "autostart": ""},
+    )
+    assert (status, payload["board"]) == (200, "other")
+
+    for bad in ({"path": "/x", "autostart": "sometimes"}, {"path": "/x", "name": 7}, {"name": "x"}):
+        assert call(f"{base}/api/boards", "POST", bad)[0] == 400
+
+
+def test_remove_then_undo_round_trips_the_registry(registry_stack):
+    base, tmp_path = registry_stack
+    add_three(base, tmp_path)
+    before = (tmp_path / "config.toml").read_text()
+
+    status, removed = call(f"{base}/api/boards/b", "DELETE")
+    assert status == 200 and removed["board"] == "b"
+    # The answer carries a token and nothing of the registry.
+    assert set(removed) == {"ok", "board", "undo"}
+    assert [board.name for board in load().boards] == ["a", "c"]
+    # The supervisor picks the new registry up on its own thread.
+    assert wait_until(
+        lambda: [b["name"] for b in call(f"{base}/api/state")[1]["boards"]] == ["a", "c"]
+    )
+
+    status, restored = call(f"{base}/api/boards", "POST", {"undo": removed["undo"]})
+    assert (status, restored["board"]) == (200, "b")
+    assert (tmp_path / "config.toml").read_text() == before
+
+    # Undoing twice must not register the board twice.
+    status, again = call(f"{base}/api/boards", "POST", {"undo": removed["undo"]})
+    assert status == 400 and "no longer be undone" in again["error"]
+
+
+def test_the_api_cannot_be_handed_registry_text(registry_stack):
+    base, tmp_path = registry_stack
+    add_three(base, tmp_path)
+    before = (tmp_path / "config.toml").read_text()
+    block = '[[board]]\nname = "evil"\nlogdir = "/x"\ncommand = ["sh", "-c", "id"]\n'
+    for payload in (
+        {"restore": {"block": block, "line": 0}},  # the shape an earlier design accepted
+        {"undo": block},
+        {"undo": {"block": block}},
+        {"undo": ""},
+    ):
+        assert call(f"{base}/api/boards", "POST", payload)[0] == 400
+    assert (tmp_path / "config.toml").read_text() == before
+
+    # Keys other than the ones the form sends are ignored, not written.
+    (tmp_path / "d" / "runs").mkdir(parents=True)
+    status, _ = call(
+        f"{base}/api/boards", "POST",
+        {"path": str(tmp_path / "d" / "runs"), "command": ["sh", "-c", "id"], "env": {"X": "1"}},
+    )
+    assert status == 200
+    assert load().board("d").command == ("tensorboard",)
+    assert load().board("d").env == {}
+
+
+def test_remove_rejects_what_it_cannot_do(registry_stack):
+    base, _ = registry_stack
+    assert call(f"{base}/api/boards/ghost", "DELETE")[0] == 404
+    assert call(f"{base}/api/boards", "DELETE")[0] == 404
+
+
+def test_a_delete_body_is_not_read_as_the_next_request(registry_stack):
+    base, tmp_path = registry_stack
+    add_three(base, tmp_path)
+    host, port = base.removeprefix("http://").split(":")
+    conn = http.client.HTTPConnection(host, int(port), timeout=10)
+    try:
+        conn.request("DELETE", "/api/boards/a", body=b"GET /api/boards/b HTTP/1.1\r\n\r\n")
+        assert conn.getresponse().read() and True
+        conn.request("GET", "/healthz")
+        response = conn.getresponse()
+        assert (response.status, json.loads(response.read())["ok"]) == (200, True)
+    finally:
+        conn.close()
+    assert [board.name for board in load().boards] == ["b", "c"]
+
+
+def test_registry_edits_are_refused_from_other_sites(registry_stack):
+    base, tmp_path = registry_stack
+    add_three(base, tmp_path)
+    for headers in ({"Origin": "http://evil.example"}, {"Sec-Fetch-Site": "cross-site"}):
+        assert call(f"{base}/api/boards/a", "DELETE", headers=headers)[0] == 403
+    assert load().board("a") is not None
+
+
+def test_filesystem_lookups_are_refused_to_other_sites_but_pages_still_load(registry_stack):
+    base, _ = registry_stack
+    # An <img> or <script> elsewhere sends no Origin, but the browser labels it.
+    for site in ("cross-site", "same-site"):
+        for path in ("/api/paths?prefix=/", "/api/suggestions", "/api/state"):
+            assert call(f"{base}{path}", headers={"Sec-Fetch-Site": site})[0] == 403
+    for site in ("same-origin", "none"):
+        assert call(f"{base}/api/suggestions", headers={"Sec-Fetch-Site": site})[0] == 200
+    # Following a link to the dashboard from another site is ordinary navigation.
+    status, _, body = fetch(f"{base}/", headers={"Sec-Fetch-Site": "cross-site"})
+    assert status == 200 and b"TensorWatch" in body
+
+
+def test_path_completion_and_suggestions_are_served(registry_stack):
+    base, _ = registry_stack
+    assert call(f"{base}/api/paths?prefix=%7E%2Fwork%2F")[1] == {
+        "paths": [{"path": "~/work/x", "events": False}]
+    }
+    assert call(f"{base}/api/paths")[1] == {"paths": [{"path": "x", "events": False}]}
+    assert call(f"{base}/api/suggestions")[1] == {
+        "suggestions": [{"path": "/s", "name": "s", "events": 1}]
+    }
+
+
+def test_registry_endpoints_are_unavailable_without_hooks(stack):
+    base, _, _ = stack
+    assert call(f"{base}/api/boards/fake", "DELETE")[0] == 501
+    assert call(f"{base}/api/boards", "POST", {"undo": "token"})[0] == 501
+    assert call(f"{base}/api/paths?prefix=/")[0] == 501
+    assert call(f"{base}/api/suggestions")[0] == 501

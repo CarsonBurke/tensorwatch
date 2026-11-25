@@ -47,7 +47,7 @@ PROBE_TIMEOUT = 0.25
 WANTED_NOFILE = 65536
 TERM_GRACE = 10.0
 
-Action = Literal["start", "stop", "restart", "demand"]
+Action = Literal["start", "stop", "restart", "demand", "renew"]
 
 
 class State(str, Enum):
@@ -81,6 +81,8 @@ class BoardStatus:
     cpu_percent: float | None
     idle_timeout: float
     demanded_ago: float | None
+    #: When a backed-off or failed board is next tried (epoch seconds), else None.
+    next_attempt: float | None
     #: Newest event-file write under the logdir, and whether that counts as live.
     last_event: float | None
     writing: bool
@@ -353,6 +355,8 @@ class Supervisor:
                 runtime.last_demand = now
                 if runtime.override is False:
                     runtime.override = None
+            elif action == "renew" and runtime.override is not False:
+                runtime.last_demand = now
             elif action == "start":
                 runtime.override = True
                 runtime.next_attempt = 0.0
@@ -409,6 +413,10 @@ class Supervisor:
                     )
                     self._terminate(runtime, reason)
                 runtime.state = State.disabled if not runtime.spec.enabled else State.stopped
+                # A crash streak ends when the board is no longer wanted; otherwise
+                # the next wake would start out backed off and read as a crash loop.
+                runtime.restarts = 0
+                runtime.next_attempt = 0.0
                 continue
 
             if alive:
@@ -670,6 +678,11 @@ class Supervisor:
             cpu_percent=runtime.cpu_percent,
             idle_timeout=spec.idle_timeout,
             demanded_ago=(now - runtime.last_demand) if runtime.last_demand else None,
+            next_attempt=(
+                runtime.next_attempt
+                if runtime.state in (State.backoff, State.failed) and runtime.next_attempt > now
+                else None
+            ),
             last_event=sample.mtime if sample is not None else None,
             writing=activity.writing(sample, now),
         )
@@ -709,7 +722,8 @@ class Supervisor:
     def _significant(statuses: Iterable[BoardStatus]) -> tuple[Any, ...]:
         """Fields worth waking the browser for (resource counters are not)."""
         return tuple(
-            (s.name, s.state, s.pid, s.message, s.restarts, s.enabled, s.port, s.writing)
+            (s.name, s.state, s.pid, s.message, s.restarts, s.enabled, s.port, s.writing,
+             s.next_attempt)
             for s in statuses
         )
 

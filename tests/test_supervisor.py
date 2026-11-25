@@ -94,6 +94,10 @@ def test_crash_lands_in_backoff_with_exit_code(tmp_path, fake_tb, free_port, sup
     # The failure reason from the child's stderr is surfaced, not swallowed.
     assert "failing on purpose" in status.message
     assert "failing on purpose" in sup.log_tail("fake")
+    # The countdown the dashboard shows comes from here, not the frozen message.
+    # A board only reads as backoff while its next attempt is still ahead.
+    assert status.next_attempt is not None
+    assert status.next_attempt <= time.time() + 64
 
 
 def test_start_timeout_kills_a_hung_board(tmp_path, fake_tb, free_port, supervisor):
@@ -119,6 +123,40 @@ def test_on_demand_board_starts_on_demand_and_stops_when_idle(
     # No further demand arrives, so the idle timeout must reclaim it.
     assert wait_until(lambda: state_of(sup) == "stopped", timeout=20), sup.snapshot()
     assert "idle" in sup.snapshot()[0].message
+
+
+def test_a_queued_lease_renewal_does_not_cancel_stop(tmp_path, fake_tb, free_port, home):
+    sup = Supervisor(build(tmp_path, fake_tb, free_port, autostart="on_demand"))
+
+    sup.request("renew", "fake")
+    sup._drain_requests()
+    sup._refresh_snapshot(force=True)
+    assert sup.snapshot()[0].demanded_ago is not None
+
+    sup.request("stop", "fake")
+    sup.request("renew", "fake")
+    sup._drain_requests()
+    sup._refresh_snapshot(force=True)
+    assert sup.snapshot()[0].demanded_ago is None
+
+    sup.request("demand", "fake")
+    sup._drain_requests()
+    sup._refresh_snapshot(force=True)
+    assert sup.snapshot()[0].demanded_ago is not None
+
+
+def test_an_idle_stop_ends_a_crash_streak(tmp_path, fake_tb, free_port, supervisor):
+    cfg = build(tmp_path, fake_tb, free_port, autostart="on_demand", idle_timeout=1.0,
+                env={"FAKE_TB_EXIT": "3"})
+    sup = supervisor(cfg)
+    sup.request("demand", "fake")
+    assert wait_until(lambda: state_of(sup) == "backoff"), sup.snapshot()
+    assert sup.snapshot()[0].restarts >= 1
+    # Nobody renews the demand, so the board is let go; its next wake starts fresh.
+    assert wait_until(lambda: state_of(sup) == "stopped", timeout=10), sup.snapshot()
+    status = sup.snapshot()[0]
+    assert status.restarts == 0
+    assert status.next_attempt is None
 
 
 def test_manual_board_only_starts_when_asked(tmp_path, fake_tb, free_port, supervisor):
@@ -220,6 +258,8 @@ def test_missing_logdir_is_reported(tmp_path, fake_tb, free_port, supervisor):
     sup = supervisor(cfg)
     assert wait_until(lambda: state_of(sup) == "failed"), sup.snapshot()
     assert "logdir does not exist" in sup.snapshot()[0].message
+    retry = sup.snapshot()[0].next_attempt
+    assert retry is not None and 0 < retry - time.time() <= 30
 
 
 def test_reload_applies_registry_changes(tmp_path, fake_tb, free_port, supervisor):
