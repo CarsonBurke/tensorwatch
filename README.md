@@ -95,10 +95,11 @@ Changing a board's port by hand leaves its saved UI on the old one.
 | `on_demand` | When you open it; stopped after 15 min idle. Use for huge archives. |
 | `manual` | Only `tensorwatch start NAME` or the dashboard button. |
 
-Each dashboard row has a `◷` control that flips that board between `on_demand`
-and `always`. It writes the registry, so the choice survives a restart, and the
-new policy takes over at once: an on-demand board keeps one idle window and then
-stops, an always board comes back up. `manual` stays a registry/CLI choice.
+The open board's row in the dashboard has an **Always / On demand / Manual**
+switch, and the `⋯` menu offers the same choice for any board. It writes the
+registry, so the choice survives a restart, and the new policy takes over at
+once: an on-demand board keeps one idle window and then stops, an always board
+comes back up.
 
 ## Commands
 
@@ -122,16 +123,49 @@ stops, an always board comes back up. `manual` stays a registry/CLI choice.
 
 ## Dashboard
 
-`1`–`9` switch board, `Ctrl`+`1`–`0` the same through board 10, `/` filter,
-`+` add a board, `Delete` remove the focused one, `↑`/`↓` move between rows,
-`w` close the open pane, `d` detach it, `Shift`+`R` reload it, `q` collapse the
-queue, `r` reload the registry. Hovering a board row shows its controls: start
-or stop, restart, on demand, log tail, own window, remove. Each queue row has a
-cancel control.
+The sidebar lists boards in registry order, so their numbers never move. Each
+row says what the board is doing in plain words: `up 3 h · 412 MB`,
+`Asleep · wakes when opened`, `Crashed (exit 1) · retrying`,
+`up 6 min · sleeps in 9 min`. A green pulse with an age means new event data
+is arriving, and a pill counts the board's mlq jobs (`▶ 1 +2`: one running, two
+waiting). Opening a board expands its row with the logdir (click to copy), the
+port, the policy switch and its actions. Right-click a row, or use its `⋯`
+button or `Shift`+`F10`, for everything else.
+
+With nothing open, the main area is an **Overview**: totals, a card for each
+board that needs attention, every board in a table, and the queue. A board that
+isn't serving gets its own page instead of a broken frame: crashing (with a
+live countdown to the next try), can't start (missing logdir, port taken),
+waking up, asleep, stopped or disabled. Each page shows the recent log and,
+where the message, exit code or log gives it away, a likely cause and how to
+check it (out of open files, killed by the OOM killer, port in use).
+
+The sidebar's queue shows running jobs, then the open board's waiting jobs,
+then others up to `[queue] visible`. `Shift`+`Q` opens the full queue below
+the board, where stopping or cancelling a job takes a second click.
+
+| Key | |
+| --- | --- |
+| `Ctrl`+`K` | Search boards, jobs and actions (`Shift`+`Enter` opens a board in its own window) |
+| `/` | Filter the sidebar; digits follow the filtered list |
+| `1`–`9`, `Ctrl`+`1`–`0` | Open a board |
+| `g` | Overview |
+| `w` / `d` / `l` | Close and unload the open board / own window / its log |
+| `Shift`+`R` | Reload the open board's pane |
+| `Enter` | On a status page: restart, try again or start |
+| `+` | Add a board |
+| `Delete` | Remove the focused board |
+| `q` / `Shift`+`Q` | Fold the sidebar queue / open the full queue |
+| `[` | Collapse the sidebar to status dots |
+| `r` | Reload the registry |
+| `Esc` | Close the topmost menu, sheet or panel |
+
+The theme follows the system; the button in the sidebar footer switches it, and
+the choice is remembered in the browser.
 
 **Adding.** The logdir field completes directories as you type (`Tab` accepts
 and descends, `↑`/`↓` choose) and marks the ones that hold runs. Name and
-autostart policy are optional. Below the form, "Found near your boards" lists
+policy are optional. Below the form, "Found near your boards" lists
 unregistered logdirs in the repositories next to the ones you already watch;
 each can be added with one click.
 
@@ -141,12 +175,12 @@ comments included. Several removals can be undone in any order. The removed
 block stays inside the manager and the dashboard only holds a token for it, so
 the unauthenticated API never accepts registry text.
 
-A row marked `▶ 12s` is receiving data: that is the newest `events.out.tfevents*`
-write under its logdir, so it counts any run under `runs/` no matter who started
-it. `○2` counts mlq jobs still queued for that board.
+"New data" is the newest `events.out.tfevents*` write under a board's logdir,
+so it counts any run under `runs/` no matter who started it.
 
 The dashboard only keeps a few TensorBoard UIs mounted (`keep_warm`, default
-2). The processes themselves follow each board's autostart policy.
+2); `w` unloads one right away. The processes themselves follow each board's
+autostart policy.
 
 ## Notes
 
