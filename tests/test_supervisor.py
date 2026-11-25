@@ -125,6 +125,26 @@ def test_on_demand_board_starts_on_demand_and_stops_when_idle(
     assert "idle" in sup.snapshot()[0].message
 
 
+def test_a_queued_lease_renewal_does_not_cancel_stop(tmp_path, fake_tb, free_port, home):
+    sup = Supervisor(build(tmp_path, fake_tb, free_port, autostart="on_demand"))
+
+    sup.request("renew", "fake")
+    sup._drain_requests()
+    sup._refresh_snapshot(force=True)
+    assert sup.snapshot()[0].demanded_ago is not None
+
+    sup.request("stop", "fake")
+    sup.request("renew", "fake")
+    sup._drain_requests()
+    sup._refresh_snapshot(force=True)
+    assert sup.snapshot()[0].demanded_ago is None
+
+    sup.request("demand", "fake")
+    sup._drain_requests()
+    sup._refresh_snapshot(force=True)
+    assert sup.snapshot()[0].demanded_ago is not None
+
+
 def test_an_idle_stop_ends_a_crash_streak(tmp_path, fake_tb, free_port, supervisor):
     cfg = build(tmp_path, fake_tb, free_port, autostart="on_demand", idle_timeout=1.0,
                 env={"FAKE_TB_EXIT": "3"})

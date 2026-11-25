@@ -1762,6 +1762,8 @@ async function showLogs(name) {
   const board = byName(name);
   if (!logsFor) logsReturn = document.activeElement;
   logsFor = name;
+  logsText = "";
+  els.logsCopy.disabled = true;
   els.logsTitle.textContent = `${name} log`;
   els.logsPath.textContent = board ? board.log_path : "";
   els.logsBody.textContent = "Loading…";
@@ -1779,6 +1781,7 @@ async function showLogs(name) {
   // A slower answer for an earlier board (or an earlier Refresh) must not land last.
   if (seq !== logsSeq || logsFor !== name) return;
   logsText = text;
+  els.logsCopy.disabled = !text;
   els.logsBody.replaceChildren(...(text ? logLines(text) : [document.createTextNode("No output yet.")]));
   els.logsBody.scrollTop = els.logsBody.scrollHeight;
 }
@@ -1857,15 +1860,12 @@ function showAddError(message) {
 /** Ask for directories matching what is typed; only the latest answer is shown. */
 function completePaths() {
   clearTimeout(paths.timer);
+  renderPaths([]);
   const prefix = els.addPath.value;
-  if (!prefix.trim()) {
-    paths.seq += 1;
-    renderPaths([]);
-    return;
-  }
   // Numbered when typed, not when asked: an answer to the previous keystroke
   // must not show up during this one's debounce.
   const seq = ++paths.seq;
+  if (!prefix.trim()) return;
   paths.timer = setTimeout(async () => {
     let items = [];
     try {
@@ -2067,7 +2067,6 @@ function connect() {
 
 /** Renew watched boards well before their idle lease expires. */
 function scheduleHeartbeat(force = false) {
-  // A board the user stopped stays stopped while it is open: `demand` would lift the stop.
   const names = [...new Set([...lru, ...(active ? [active] : [])])]
     .filter((name) => byName(name) && !isStoppedByUser(byName(name)));
   const watched = names.map(byName);
@@ -2091,7 +2090,7 @@ function scheduleHeartbeat(force = false) {
   // on an accidentally tiny timeout. Hidden windows release their leases.
   period = Math.max(250, period);
   const renew = () => {
-    for (const name of names) act(name, "demand").catch(() => {});
+    for (const name of names) act(name, "renew").catch(() => {});
     heartbeatTimer = setTimeout(renew, period);
   };
   // Renew immediately when restoring a selection, resuming the window, or
@@ -2130,7 +2129,9 @@ els.themeToggle.addEventListener("click", toggleTheme);
 els.drawerClose.addEventListener("click", () => toggleDrawer(false));
 els.logsClose.addEventListener("click", closeLogs);
 els.logsRefresh.addEventListener("click", () => logsFor && showLogs(logsFor));
-els.logsCopy.addEventListener("click", () => copy(logsText, "the log"));
+els.logsCopy.addEventListener("click", () => {
+  if (logsText) copy(logsText, "the log");
+});
 // Focus goes back to a board row, never to the filter: a text field would
 // swallow the next shortcut.
 function restoreFocus() {

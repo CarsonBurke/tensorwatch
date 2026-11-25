@@ -47,7 +47,7 @@ PROBE_TIMEOUT = 0.25
 WANTED_NOFILE = 65536
 TERM_GRACE = 10.0
 
-Action = Literal["start", "stop", "restart", "demand"]
+Action = Literal["start", "stop", "restart", "demand", "renew"]
 
 
 class State(str, Enum):
@@ -355,6 +355,8 @@ class Supervisor:
                 runtime.last_demand = now
                 if runtime.override is False:
                     runtime.override = None
+            elif action == "renew" and runtime.override is not False:
+                runtime.last_demand = now
             elif action == "start":
                 runtime.override = True
                 runtime.next_attempt = 0.0

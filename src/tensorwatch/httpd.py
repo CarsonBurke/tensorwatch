@@ -273,7 +273,7 @@ class ControlHandler(BaseHTTPRequestHandler):
             name, action = unquote(parts[2]), parts[3]
             if action == "autostart":
                 return self._set_autostart(name, raw)
-            if action not in ("start", "stop", "restart", "demand"):
+            if action not in ("start", "stop", "restart", "demand", "renew"):
                 return self._error(HTTPStatus.NOT_FOUND, f"unknown action {action!r}")
             try:
                 self.supervisor.request(action, name)  # type: ignore[arg-type]

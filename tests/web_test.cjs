@@ -139,7 +139,7 @@ function dashboard(selected = "short", routes = () => undefined) {
 const board = (name, idle_timeout, autostart = "on_demand") =>
   ({ name, idle_timeout, autostart, state: "running" });
 const times = (app, name) => app.requests
-  .filter(({ url }) => url === `/api/boards/${name}/demand`).map(({ at }) => at);
+  .filter(({ url }) => url === `/api/boards/${name}/renew`).map(({ at }) => at);
 
 test("60-second idle leases renew before expiry despite frequent state updates", () => {
   const app = dashboard();
@@ -465,6 +465,16 @@ test("an answer to the previous keystroke is dropped even if it lands mid-deboun
   assert.equal(app.el("add-board-paths").children.length, 0);
 });
 
+test("a new path prefix immediately invalidates the displayed suggestions", () => {
+  const app = dashboard();
+  const input = app.el("add-board-path");
+  app.run('renderPaths([{ path: "~/old" }])');
+  input.value = "~/new";
+  app.run('completePaths(); onPathKey({ key: "Tab", preventDefault() {} })');
+  assert.equal(input.value, "~/new");
+  assert.equal(app.el("add-board-paths").hidden, true);
+});
+
 test("holding Enter on the add form registers the logdir once", async () => {
   const app = dashboard("", (method, url) =>
     (url === "/api/boards" ? { ok: true, board: "fresh", events: true } : undefined));
@@ -597,6 +607,22 @@ test("a slow log answer for an earlier board never replaces the current one", as
   await settle();
   assert.equal(app.run("logsText"), "log of b");
   assert.match(app.el("logs-body").text, /log of b/);
+});
+
+test("copy is unavailable while another board's log loads or fails", async () => {
+  let fail;
+  const app = dashboard("", (method, url) => {
+    if (url.includes("/a/logs")) return "log of a";
+    if (url.includes("/b/logs")) return new Promise((resolve) => { fail = resolve; });
+  });
+  await app.run('showLogs("a")');
+  assert.equal(app.el("logs-copy").disabled, false);
+  const loading = app.run('showLogs("b")');
+  assert.equal(app.el("logs-copy").disabled, true);
+  assert.equal(app.run("logsText"), "");
+  fail({ error: "missing log" });
+  await loading;
+  assert.equal(app.el("logs-copy").disabled, true);
 });
 
 test("a board the user stopped is not woken again by the open pane's heartbeat", () => {
