@@ -41,10 +41,6 @@ const els = {
   queueJobs: $("queue-jobs"),
   queueMore: $("queue-more"),
   queueError: $("queue-error"),
-  drawer: $("drawer"),
-  drawerMeta: $("drawer-meta"),
-  drawerBody: $("drawer-body"),
-  drawerClose: $("drawer-close"),
   palette: $("palette"),
   paletteIcon: $("palette-icon"),
   paletteInput: $("palette-input"),
@@ -92,10 +88,8 @@ let pendingSelect = null;
 let revealActive = true;
 let heartbeatTimer = null;
 let heartbeatKey = "";
-/** The full queue table, split below the pane. */
-let drawerOpen = false;
-let drawerKey = "";
-/** Queue job id -> timer, for the second click that confirms a kill or cancel. */
+let queueExpanded = false;
+/** Queue job id -> confirmation state and timer. */
 const armed = new Map();
 /**
  * The log tail shown on the open status page and matched for hints:
@@ -687,8 +681,6 @@ function render() {
     setLabel(els.openPalette, "Search and commands (Ctrl K)");
     setIcon(els.collapseRail, "side");
     renderRailLabel();
-    setIcon(els.drawerClose, "close");
-    setLabel(els.drawerClose, "Close the queue (Shift Q)");
     setIcon(els.logsClose, "close");
     setLabel(els.logsClose, "Close the log (Esc)");
     setIcon(els.addClose, "close");
@@ -705,7 +697,6 @@ function render() {
     boardRows.get(active).el.scrollIntoView?.({ block: "nearest" });
   }
   renderQueue();
-  renderDrawer();
   renderTotals();
   renderThemeToggle();
   scheduleHeartbeat();
@@ -976,10 +967,11 @@ function renderQueue() {
     return;
   }
   els.queue.hidden = false;
-  // With the full table open below the pane, the sidebar keeps only its header.
-  const collapsed = localStorage.getItem(QUEUE_KEY) === "1" || drawerOpen;
+  const collapsed = localStorage.getItem(QUEUE_KEY) === "1";
   els.queue.classList.toggle("collapsed", collapsed);
+  els.queue.classList.toggle("expanded", queueExpanded);
   els.queueHead.setAttribute("aria-expanded", String(!collapsed));
+  els.queueMore.setAttribute("aria-expanded", String(queueExpanded));
 
   const limit = snapshot.effective_limit;
   const slots = snapshot.connected && limit
@@ -1002,12 +994,17 @@ function renderQueue() {
   els.queueError.title = detail;
 
   // Running jobs always show (there are only as many as slots), then the open
-  // board's waiting jobs, then the rest up to queue_visible.
+  // board's waiting jobs, then the remaining jobs within the preview limit.
   const visible = Math.max(1, state.server.queue_visible || 5);
-  const mine = active ? snapshot.queued.filter((job) => (job.boards || []).includes(active)) : [];
-  const rest = snapshot.queued.filter((job) => !mine.includes(job));
+  const mine = [];
+  const rest = [];
+  for (const job of snapshot.queued) {
+    (active && job.boards?.includes(active) ? mine : rest).push(job);
+  }
   const budget = Math.max(0, visible - snapshot.running.length - mine.length);
-  const shownRest = rest.slice(0, budget);
+  const shownRest = queueExpanded ? rest : rest.slice(0, budget);
+  const focused = document.activeElement;
+  const hadFocus = focused && els.queueJobs.contains?.(focused);
   const nodes = [];
   const seen = new Set();
   const add = (job) => {
@@ -1029,15 +1026,34 @@ function renderQueue() {
   for (const [id] of jobRows) if (!seen.has(id)) jobRows.delete(id);
   const current = els.queueJobs.children;
   if (current.length !== nodes.length || nodes.some((node, i) => current[i] !== node)) {
+    const scroll = els.queueJobs.scrollTop;
     els.queueJobs.replaceChildren(...nodes);
+    els.queueJobs.scrollTop = scroll;
+  }
+  if (hadFocus) {
+    if (!els.queueJobs.contains(focused) || focused.hidden || focused.disabled) {
+      els.queueMore.focus();
+    } else if (document.activeElement !== focused) {
+      focused.focus({ preventScroll: true });
+    }
   }
 
   const hidden = rest.length - shownRest.length;
-  const moreText = `${hidden > 0 ? `${hidden} more · ` : ""}${drawerOpen ? "Close" : "Open"} full queue`;
+  const moreText = queueExpanded ? "Show compact queue" : `${hidden > 0 ? `${hidden} more · ` : ""}Show full queue`;
   if (els.queueMore.dataset.key !== moreText) {
     els.queueMore.dataset.key = moreText;
     els.queueMore.replaceChildren(h("span", { text: moreText }), kbd("⇧ Q"));
   }
+}
+
+function toggleQueueExpanded(expand = !queueExpanded) {
+  queueExpanded = expand;
+  if (expand) {
+    localStorage.setItem(QUEUE_KEY, "0");
+    if (railCollapsed()) setRail(false);
+  }
+  schedule();
+  requestAnimationFrame(() => els.queueMore.focus());
 }
 
 /** One line per job: its name, then whatever is unusual about it. The rest is in the tooltip. */
@@ -1047,14 +1063,10 @@ function jobRow(job, snapshot) {
     const glyph = h("span", { class: "glyph" });
     const name = h("span", { class: "jname" });
     const when = h("span", { class: "when" });
-    const el = h("div", { class: "job", role: "button", tabindex: "0", onclick: () => openJobBoard(job.id),
-      onkeydown: (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          openJobBoard(job.id);
-        }
-      } }, glyph, name, when);
-    row = { el, glyph, name, when, key: "" };
+    const link = h("button", { type: "button", class: "job", onclick: () => openJobBoard(job.id) }, glyph, name, when);
+    const cancel = h("button", { type: "button", class: "btn sm", onclick: () => cancelJob(job.id) });
+    const el = h("div", { class: "queue-job" }, link, cancel);
+    row = { el, link, cancel, glyph, name, when, key: "", actionKey: "" };
     jobRows.set(job.id, row);
   }
   const running = job.state === "running";
@@ -1072,14 +1084,27 @@ function jobRow(job, snapshot) {
     `${tag ? `Board: ${tag}` : `Project: ${job.project}`} · ${job.cwd}`,
     snapshot.connected ? "" : "mlq is offline; this is the last known state",
   ].filter(Boolean).join("\n");
-  const key = [job.state, job.name, aside, title, tag].join("|");
+  const linked = Boolean(tag && byName(tag));
+  const key = [job.state, job.name, aside, title, linked].join("|");
   if (row.key !== key) {
     row.key = key;
-    row.el.className = `job ${job.state}${tag && byName(tag) ? " linked" : ""}`;
-    row.el.title = title;
+    row.link.className = `job ${job.state}${linked ? " linked" : ""}`;
+    row.link.disabled = !linked;
+    row.link.title = title;
     row.glyph.replaceChildren(icon(running ? "play" : job.state === "held" ? "pause" : "circle"));
     row.name.textContent = job.name;
     row.when.textContent = aside;
+  }
+  const confirm = isJobArmed(job);
+  const action = running ? "Stop" : "Cancel";
+  const hideAction = !queueExpanded || !snapshot.connected;
+  const actionKey = [hideAction, confirm, action, job.name].join("|");
+  if (row.actionKey !== actionKey) {
+    row.actionKey = actionKey;
+    row.cancel.hidden = hideAction;
+    row.cancel.classList.toggle("confirm", confirm);
+    row.cancel.textContent = confirm ? `${action}?` : action;
+    setLabel(row.cancel, `${action}${confirm ? " confirmation for" : ""} job #${job.id} ${job.name}`);
   }
   return row;
 }
@@ -1091,23 +1116,26 @@ function openJobBoard(id) {
 }
 
 /** Kill and cancel take a second click within 3 s; a stray click costs a job hours. */
+const isJobArmed = (job) => armed.get(job.id)?.running === (job.state === "running");
+
 function cancelJob(id) {
   const job = allJobs().find((candidate) => candidate.id === id);
-  if (!job) return;
-  if (!armed.has(id)) {
-    armed.set(id, setTimeout(() => {
+  if (!job || !queue()?.connected) return;
+  const running = job.state === "running";
+  clearTimeout(armed.get(id)?.timer);
+  if (!isJobArmed(job)) {
+    const timer = setTimeout(() => {
       armed.delete(id);
-      drawerKey = viewKey = "";
+      viewKey = "";
       schedule();
-    }, 3000));
-    drawerKey = viewKey = "";
+    }, 3000);
+    armed.set(id, { running, timer });
+    viewKey = "";
     schedule();
     return;
   }
-  clearTimeout(armed.get(id));
   armed.delete(id);
-  drawerKey = viewKey = "";
-  const running = job.state === "running";
+  viewKey = "";
   post(`/api/queue/${job.id}/cancel`)
     .then(() => say(running ? `Stopping #${job.id} ${job.name}. Its slot frees up once it exits.` : `Cancelled #${job.id} ${job.name}`))
     .catch(reportError);
@@ -1122,7 +1150,7 @@ function queueTable() {
     const tries = Number.parseInt(job.attempts, 10) || 0;
     const tag = job.board || (job.boards || [])[0] || "";
     const fraction = running && job.time_limit && job.since ? Math.min(1, (nowSec() - job.since) / job.time_limit) : null;
-    const isArmed = armed.has(job.id);
+    const isArmed = isJobArmed(job);
     const details = running
       ? (tries > 1 ? `Attempt ${job.attempts}` : "")
       : job.state === "held" ? "Held until released"
@@ -1170,27 +1198,6 @@ function queueSummary(snapshot) {
   if (!snapshot.connected) return "mlq offline · last known state";
   const limit = snapshot.effective_limit;
   return `${snapshot.active_leases}${limit ? ` of ${limit}` : ""} running · ${snapshot.queued.length} waiting`;
-}
-
-function toggleDrawer(open = !drawerOpen) {
-  // Closing makes the drawer inert; focus inside it would be stranded there.
-  if (!open && els.drawer.contains?.(document.activeElement)) restoreFocus();
-  drawerOpen = open;
-  drawerKey = "";
-  schedule();
-  if (open) requestAnimationFrame(() => els.drawerBody.querySelector?.("tbody tr")?.focus());
-}
-
-function renderDrawer() {
-  els.drawer.classList.toggle("open", drawerOpen);
-  els.drawer.inert = !drawerOpen;
-  if (!drawerOpen) return;
-  const snapshot = queue();
-  els.drawerMeta.textContent = queueSummary(snapshot);
-  const key = JSON.stringify([queueKey(snapshot), [...armed.keys()], state.boards.map((b) => b.name)]);
-  if (key === drawerKey) return;
-  drawerKey = key;
-  rebuild(els.drawerBody, queueTable());
 }
 
 /* ------------------------------------------------------------- pane surface */
@@ -1649,7 +1656,7 @@ function renderPalette() {
     ...state.boards.filter((b) => (b.state === "failed" || isCrashing(b)) && b !== cur).map((b) => ({
       label: `Restart ${b.name}`, iconName: "restart", aside: stateWord(b), run: () => act(b.name, "restart").catch(reportError) })),
     { label: "Go to overview", iconName: "home", aside: "g", run: showOverview },
-    queue() && { label: drawerOpen ? "Close full queue" : "Open full queue", iconName: "queue", aside: "⇧ Q", run: () => toggleDrawer() },
+    queue() && { label: queueExpanded ? "Show compact queue" : "Show full queue", iconName: "queue", aside: "⇧ Q", run: () => toggleQueueExpanded() },
     { label: "Add a board…", iconName: "plus", aside: "+", run: showAddBoard },
     { label: "Reload registry", iconName: "refresh", aside: "r", run: reloadRegistry },
     { label: "Show or hide the sidebar", iconName: "side", aside: "[", run: toggleRail },
@@ -2126,7 +2133,6 @@ els.navOverview.addEventListener("click", showOverview);
 els.openPalette.addEventListener("click", openPalette);
 els.collapseRail.addEventListener("click", toggleRail);
 els.themeToggle.addEventListener("click", toggleTheme);
-els.drawerClose.addEventListener("click", () => toggleDrawer(false));
 els.logsClose.addEventListener("click", closeLogs);
 els.logsRefresh.addEventListener("click", () => logsFor && showLogs(logsFor));
 els.logsCopy.addEventListener("click", () => {
@@ -2159,12 +2165,9 @@ els.addForm.addEventListener("submit", (event) => {
   submitAddBoard(event);
 });
 els.addDialog.addEventListener("close", restoreFocus);
-els.queueMore.addEventListener("click", () => toggleDrawer());
+els.queueMore.addEventListener("click", () => toggleQueueExpanded());
 els.queueHead.addEventListener("click", () => {
-  if (drawerOpen) {
-    toggleDrawer(false);
-    return;
-  }
+  queueExpanded = false;
   localStorage.setItem(QUEUE_KEY, localStorage.getItem(QUEUE_KEY) === "1" ? "0" : "1");
   schedule();
 });
@@ -2198,7 +2201,7 @@ document.addEventListener("keydown", (event) => {
     // Closes only the topmost layer.
     if (menuFor) closeMenu(true);
     else if (logsFor) closeLogs();
-    else if (drawerOpen) toggleDrawer(false);
+    else if (queueExpanded && els.queue.contains(document.activeElement)) toggleQueueExpanded(false);
     return;
   }
   if (event.ctrlKey && !event.metaKey && !event.altKey && event.key >= "0" && event.key <= "9") {
@@ -2226,7 +2229,7 @@ document.addEventListener("keydown", (event) => {
     g: showOverview,
     "[": toggleRail,
     q: () => els.queueHead.click(),
-    Q: () => queue() && toggleDrawer(),
+    Q: () => queue() && toggleQueueExpanded(),
     r: reloadRegistry,
   }[event.key];
   if (global) {

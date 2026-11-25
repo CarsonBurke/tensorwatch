@@ -52,7 +52,7 @@
         <div id="queue-body">
           <div id="queue-error" class="queue-error" hidden></div>
           <div id="queue-jobs"></div>
-          <button id="queue-more" class="more" type="button"></button>
+          <button id="queue-more" class="more" type="button" aria-expanded="false" aria-controls="queue-jobs"></button>
         </div>
       </section>
 
@@ -67,14 +67,6 @@
       <section id="panes">
         <div id="view" class="view" hidden></div>
         <div id="toasts" role="status" aria-live="polite"></div>
-      </section>
-      <section id="drawer" aria-label="All queue jobs" inert>
-        <header>
-          <strong>Queue</strong><span id="drawer-meta" class="muted"></span>
-          <span class="grow"></span>
-          <button id="drawer-close" class="icon-btn" type="button"></button>
-        </header>
-        <div id="drawer-body" class="drawer-body"></div>
       </section>
     </main>
 

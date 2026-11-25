@@ -516,6 +516,41 @@ test("the sidebar queue lists running jobs, then the open board's, then others u
     .map((node) => (node.find((child) => child.className === "jname") || node).textContent);
   assert.deepEqual(nodes, ["Running", "job1", "mine's jobs", "job4", "Other jobs", "job2", "job3"]);
   assert.match(app.el("queue-more").text, /1 more/);
+
+  const firstRow = app.el("queue-jobs").children[1];
+  const stop = firstRow.children[1];
+  assert.equal(stop.hidden, true);
+  app.el("queue-more").fire("click");
+  app.run("render()");
+  assert.equal(app.el("queue-more").attributes["aria-expanded"], "true");
+  assert.equal(firstRow, app.el("queue-jobs").children[1]);
+  assert.equal(stop.hidden, false);
+  assert.equal(stop.textContent, "Stop");
+  assert.ok(app.el("queue-jobs").find((node) => node.textContent === "job5"));
+
+  app.el("queue-more").fire("click");
+  app.run("render()");
+  assert.equal(app.el("queue-more").attributes["aria-expanded"], "false");
+  assert.equal(stop.hidden, true);
+  assert.ok(!app.el("queue-jobs").find((node) => node.textContent === "job5"));
+});
+
+test("a queued job that starts needs a fresh confirmation to stop", () => {
+  const app = dashboard("");
+  app.update([], { queue: queueOf([], [job(7, {})]) });
+  app.run("toggleQueueExpanded(); render()");
+  const action = app.el("queue-jobs").children[1].children[1];
+  action.fire("click");
+  app.run("render()");
+  assert.equal(action.textContent, "Cancel?");
+
+  app.update([], { queue: queueOf([job(7, { state: "running" })], []) });
+  app.run("render()");
+  assert.equal(action.textContent, "Stop");
+  action.fire("click");
+  app.run("render()");
+  assert.equal(action.textContent, "Stop?");
+  assert.ok(!app.requests.some(({ url }) => url.startsWith("/api/queue/")));
 });
 
 test("stopping a job takes a second click, and the first one wears off", async () => {

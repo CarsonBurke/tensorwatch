@@ -279,20 +279,32 @@ button.sect:hover { color: var(--fg); }
 .seg button:hover { color: var(--fg); }
 .seg button[aria-pressed="true"] { background: var(--raised); color: var(--fg); font-weight: 500; box-shadow: var(--shadow); }
 
-/* rail queue: a glance, capped to a third of the rail; the drawer has the rest */
-#queue { flex: 0 1 auto; display: flex; flex-direction: column; min-height: 0; max-height: 34%; border-top: 1px solid var(--line); }
-/* Jobs scroll; the link to the full queue stays in view below them. */
+/* The queue uses more of the sidebar when expanded. Its controls stay in view. */
+#queue {
+  flex: 0 1 auto; display: flex; flex-direction: column; min-height: 0;
+  max-height: 34%; border-top: 1px solid var(--line);
+  transition: max-height var(--motion-panel) var(--motion-ease);
+}
+#queue.expanded { max-height: 70%; }
+@media (max-height: 500px) {
+  #rail:has(#queue.expanded) #boards { flex: 0 0 8vh; min-height: 0; }
+}
+#queue-head { flex: none; }
 #queue-body { display: flex; flex-direction: column; min-height: 0; padding: 0 8px 8px; }
-#queue-jobs { min-height: 0; overflow-y: auto; scrollbar-width: thin; }
+#queue-jobs { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 #queue-body > :not(#queue-jobs) { flex: none; }
 #queue.collapsed #queue-body { display: none; }
 .slots { display: inline-flex; gap: 3px; }
 .slots i { width: 12px; height: 5px; border-radius: 3px; background: var(--line); }
 .slots i.on { background: var(--accent); }
+.queue-job { display: flex; align-items: center; gap: 4px; }
+.queue-job > .btn { flex: none; height: 24px; padding: 0 6px; }
 .job {
   display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; column-gap: 8px; align-items: center;
-  padding: 4px 10px; border-radius: 8px;
+  flex: 1; min-width: 0; padding: 4px 10px; border: 0; border-radius: 8px;
+  background: none; text-align: left;
 }
+.job:disabled { cursor: default; }
 .job.linked { cursor: pointer; }
 .job.linked:hover { background: var(--hover); }
 .job .glyph { display: grid; place-items: center; color: var(--accent); }
@@ -447,19 +459,6 @@ table.t { width: 100%; border-collapse: collapse; }
 .boardlink:hover { text-decoration: underline; text-underline-offset: 3px; }
 .legend { color: var(--fg-4); font-size: 12.5px; line-height: 2.1; }
 
-/* full queue: a split that resizes the pane, never an overlay on it */
-#drawer {
-  flex: none; height: 0; overflow: hidden;
-  display: flex; flex-direction: column;
-  background: var(--bg); border-top: 0 solid var(--line);
-  container-type: inline-size;
-  transition: height var(--motion-panel) var(--motion-ease);
-}
-#drawer.open { height: clamp(220px, 38%, 380px); border-top-width: 1px; }
-#drawer header { flex: none; display: flex; align-items: center; gap: 10px; padding: 8px 10px 8px 20px; border-bottom: 1px solid var(--line); }
-#drawer header strong { font-size: 14px; font-weight: 600; }
-.drawer-body { flex: 1; overflow: auto; padding: 0 8px; }
-#drawer .tw { margin: 0; border: 0; border-radius: 0; box-shadow: none; overflow: visible; }
 .t td.when { padding-right: 20px; }
 
 /* palette */
