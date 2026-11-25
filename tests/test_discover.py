@@ -37,6 +37,15 @@ def test_an_empty_container_is_not_proposed(tmp_path):
     assert found(tmp_path) == []
 
 
+def test_event_named_directories_and_dangling_links_are_not_event_files(tmp_path):
+    container = tmp_path / "runs"
+    (container / EVENT).mkdir(parents=True)
+    (container / f"{EVENT}.link").symlink_to(container / "missing")
+    assert found(tmp_path) == []
+    assert not discover.has_events(container)
+    assert discover.count_events(container) == 0
+
+
 def test_sibling_runs_are_grouped_and_a_lone_run_stays_itself(tmp_path):
     run(tmp_path, "proj/ablations/a", "proj/ablations/b", "other/single")
     assert found(tmp_path) == ["other/single", "proj/ablations"]

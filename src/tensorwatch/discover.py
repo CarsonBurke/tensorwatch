@@ -55,6 +55,10 @@ def _walkable(entry: os.DirEntry[str]) -> bool:
     )
 
 
+def _is_event(entry: os.DirEntry[str]) -> bool:
+    return entry.name.startswith(EVENT_PREFIX) and entry.is_file(follow_symlinks=False)
+
+
 def has_events(root: str | Path, budget: int = PROBE_BUDGET) -> bool:
     """True as soon as one event file turns up under ``root``.
 
@@ -69,7 +73,7 @@ def has_events(root: str | Path, budget: int = PROBE_BUDGET) -> bool:
         try:
             with os.scandir(queue.popleft()) as entries:
                 for entry in entries:
-                    if entry.name.startswith(EVENT_PREFIX):
+                    if _is_event(entry):
                         return True
                     if _walkable(entry):
                         queue.append(entry.path)
@@ -91,7 +95,7 @@ def count_events(root: str | Path, limit: int = 5000, budget: int | None = None)
         try:
             with os.scandir(stack.pop()) as entries:
                 for entry in entries:
-                    if entry.name.startswith(EVENT_PREFIX):
+                    if _is_event(entry):
                         total += 1
                         if total >= limit:
                             return total
@@ -105,7 +109,7 @@ def count_events(root: str | Path, limit: int = 5000, budget: int | None = None)
 def _holds_directly(directory: str) -> bool:
     try:
         with os.scandir(directory) as entries:
-            return any(entry.name.startswith(EVENT_PREFIX) for entry in entries)
+            return any(_is_event(entry) for entry in entries)
     except OSError:
         return False
 
@@ -126,7 +130,7 @@ def _survey(root: Path, max_depth: int) -> tuple[list[Path], set[Path]]:
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if entry.name.startswith(EVENT_PREFIX):
+                    if _is_event(entry):
                         holds_events = True
                     elif not _walkable(entry) or depth >= max_depth:
                         continue
