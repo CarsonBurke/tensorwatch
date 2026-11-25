@@ -650,9 +650,12 @@ function showOverview() {
   schedule();
 }
 
+/**
+ * Open a board in its own window. The window loads a dashboard page that frames
+ * the board, so it keeps TensorWatch running after this window closes.
+ */
 function detach(name) {
-  const board = byName(name);
-  if (board) window.open(board.url, `tb-${name}`, "noopener");
+  if (byName(name)) window.open(`/boards/${encodeURIComponent(name)}`, `tb-${name}`, "noopener");
 }
 
 function reloadPane(name) {
@@ -2063,13 +2066,24 @@ function absorb(payload) {
   schedule();
 }
 
+let source = null;
+
 function connect() {
-  const source = new EventSource("/api/events");
+  source = new EventSource("/api/events");
   source.onmessage = (event) => absorb(JSON.parse(event.data));
   source.onerror = () => {
     streamDown = true;
     schedule();
   };
+}
+
+// The stream is what tells TensorWatch a window is open, so a page the browser
+// keeps after navigating away (back/forward cache) must not hold it.
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", () => source?.close());
+  window.addEventListener("pageshow", (event) => {
+    if (event.persisted) connect();
+  });
 }
 
 /** Renew watched boards well before their idle lease expires. */

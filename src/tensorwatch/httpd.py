@@ -55,6 +55,7 @@ class ControlServer(ThreadingHTTPServer):
         on_restore: Callable[[str], Any] | None = None,
         on_complete: Callable[[str], Any] | None = None,
         on_suggest: Callable[[], Any] | None = None,
+        sock: socket.socket | None = None,
     ) -> None:
         self.supervisor = supervisor
         self.on_reload = on_reload
@@ -66,7 +67,15 @@ class ControlServer(ThreadingHTTPServer):
         self.on_complete = on_complete
         self.on_suggest = on_suggest
         self.started_at = time.time()
-        super().__init__(address, ControlHandler)
+        if sock is None:
+            super().__init__(address, ControlHandler)
+            return
+        # Socket activation: systemd already bound and is listening on the
+        # address, and keeps doing so after this process exits.
+        super().__init__(sock.getsockname()[:2], ControlHandler, bind_and_activate=False)
+        self.socket.close()
+        self.socket = sock
+        self.server_address = sock.getsockname()
 
     def handle_error(self, request, client_address) -> None:  # noqa: D102 - quiet resets
         import sys
@@ -153,6 +162,12 @@ class ControlHandler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------- routing
 
+    def parse_request(self) -> bool:
+        ok = super().parse_request()
+        if ok:
+            self.supervisor.touch()
+        return ok
+
     def do_GET(self) -> None:
         if not self._local_only():
             return self._error(HTTPStatus.FORBIDDEN, "cross-origin request refused")
@@ -161,6 +176,10 @@ class ControlHandler(BaseHTTPRequestHandler):
 
         if path == "/":
             return self._static("index.html")
+        if path.startswith("/boards/") and path.count("/") == 2:
+            # A board in its own window. The page lives on this origin so that
+            # it holds a dashboard stream: the manager must not exit under it.
+            return self._static("board.html")
         if path == "/healthz":
             return self._json({"ok": True, "uptime": time.time() - self.server.started_at})
         if path.startswith("/static/"):
@@ -420,11 +439,16 @@ def serve(
     on_restore: Callable[[str], Any] | None = None,
     on_complete: Callable[[str], Any] | None = None,
     on_suggest: Callable[[], Any] | None = None,
+    sock: socket.socket | None = None,
 ) -> ControlServer:
-    """Start the control server on a background thread and return it."""
+    """Start the control server on a background thread and return it.
+
+    ``sock`` is an already-listening socket handed over by systemd; without
+    one the server binds ``host:port`` itself.
+    """
     server = ControlServer(
         (host, port), supervisor, on_reload, on_cancel, on_add, on_autostart,
-        on_remove, on_restore, on_complete, on_suggest,
+        on_remove, on_restore, on_complete, on_suggest, sock,
     )
     thread = threading.Thread(target=server.serve_forever, name="tensorwatch-httpd", daemon=True)
     thread.start()

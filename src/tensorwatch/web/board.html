@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>TensorWatch</title>
+    <link rel="icon" href="/static/icon-32.png" type="image/png" sizes="32x32" />
+    <link rel="icon" href="/static/icon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script>
+      try {
+        const theme = localStorage.getItem("tensorwatch.theme");
+        if (theme) document.documentElement.dataset.theme = theme;
+      } catch {}
+    </script>
+  </head>
+  <body class="solo">
+    <div id="solo-banner" class="solo-banner" role="status" hidden></div>
+    <section id="solo-status" class="solo-status" aria-live="polite">
+      <h1 id="solo-title"></h1>
+      <p id="solo-message" class="muted"></p>
+      <p class="solo-actions">
+        <button id="solo-start" class="btn primary sm" type="button" hidden>Start</button>
+        <a id="solo-dashboard" class="btn sm" href="/">Open the dashboard</a>
+      </p>
+    </section>
+    <script src="/static/board.js"></script>
+  </body>
+</html>
