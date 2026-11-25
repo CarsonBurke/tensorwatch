@@ -14,6 +14,10 @@ get forgotten, processes die on reboot, and you end up with a pile of tabs.
 If [mlq](https://github.com/CarsonBurke/mlqueue) is running, the GPU queue
 shows up in the same sidebar, tagged with the board each job writes to.
 
+![TensorWatch overview showing board status, recent activity, and queued jobs](docs/dashboard-overview.webp)
+
+The screenshots use example boards and jobs.
+
 It is a single-user Linux workstation tool. Everything binds loopback. There
 is no authentication. It is not a TensorBoard fork and not a remote service.
 
@@ -140,6 +144,8 @@ waking up, asleep, stopped or disabled. Each page shows the recent log and,
 where the message, exit code or log gives it away, a likely cause and how to
 check it (out of open files, killed by the OOM killer, port in use).
 
+![Dark dashboard showing a board's retry countdown, run policy, and recent logs](docs/dashboard-board-status.webp)
+
 The sidebar's queue shows running jobs, then the open board's waiting jobs,
 then others up to `[queue] visible`. `Shift`+`Q` opens the full queue below
 the board, where stopping or cancelling a job takes a second click.
@@ -161,7 +167,8 @@ the board, where stopping or cancelling a job takes a second click.
 | `Esc` | Close the topmost menu, sheet or panel |
 
 The theme follows the system; the button in the sidebar footer switches it, and
-the choice is remembered in the browser.
+the choice is remembered in the browser. The dashboard respects the system's
+reduced-motion preference.
 
 **Adding.** The logdir field completes directories as you type (`Tab` accepts
 and descends, `↑`/`↓` choose) and marks the ones that hold runs. Name and
