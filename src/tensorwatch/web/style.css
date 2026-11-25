@@ -212,7 +212,7 @@ button.sect:hover { color: var(--fg); }
   padding: 7px 10px; border-radius: 9px; cursor: pointer;
 }
 .board:hover { background: var(--hover); }
-.board.active { background: var(--sel); cursor: default; }
+.board.active { background: var(--raised); cursor: default; }
 .board.hidden { display: none; }
 .b-l1, .b-l2 { grid-column: 2; display: flex; align-items: center; gap: 8px; min-width: 0; }
 .b-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-2); font-weight: 500; }
@@ -233,7 +233,7 @@ button.sect:hover { color: var(--fg); }
 .b-ext {
   grid-column: 1 / -1; display: grid; gap: 10px;
   margin-top: 10px; padding-top: 10px;
-  border-top: 1px solid color-mix(in srgb, var(--accent) 18%, transparent);
+  border-top: 1px solid var(--line);
   cursor: auto;
 }
 .b-path { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; color: var(--fg-3); }
