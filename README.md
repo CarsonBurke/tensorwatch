@@ -1,16 +1,18 @@
 # TensorWatch
 
-TensorWatch supervises TensorBoard on a Linux workstation. Register each
-project's log directory once, then switch between boards in one dashboard.
-A systemd user service brings your always-on boards back after a reboot. When
-[mlq](https://github.com/CarsonBurke/mlqueue) is running, the dashboard also
-shows which GPU jobs are writing to each board.
+Keep your projects' TensorBoards in one window. Register each project's log
+directory once, then pick a board from the sidebar to open its charts.
+TensorWatch runs locally on Linux and manages the TensorBoard processes.
 
-| Light overview | Dark board diagnostics |
-| --- | --- |
-| ![Board status, recent activity, and queued jobs in the light theme](docs/dashboard-overview.webp) | ![A retry countdown, recent logs, and the expanded sidebar queue in the dark theme](docs/dashboard-board-status.webp) |
+**Light**
 
-The screenshots use example boards and jobs.
+![An open TensorBoard board with training curves in TensorWatch's light theme](docs/dashboard-board-light.webp)
+
+**Dark**
+
+![The open TensorBoard board in TensorWatch's dark theme](docs/dashboard-board-dark.webp)
+
+Both screenshots show TensorBoard rendering example runs.
 
 ## Get started
 
@@ -62,24 +64,19 @@ Change the policy in the open board's sidebar row, its `⋯` menu, or with
 `tensorwatch set NAME autostart=on_demand`. The choice is stored in the
 registry. Use **On demand** for archives you open occasionally.
 
-## Dashboard
+## Work with boards
 
-The overview shows running boards, new event data, boards that need attention,
-and the mlq queue. Open a board to see its TensorBoard pane. The sidebar row
-expands to show the logdir, port, policy, and controls. Click the logdir to copy
-it, or right-click a row for its actions.
-
-A board that is starting, stopped, or crashing shows its status and recent
-logs. A crash page includes the next retry time and points out recognizable
-log messages, such as a port in use or a file descriptor limit.
+Pick a board in the sidebar or press its number to switch to it. The selected
+row shows the logdir, port, run policy, and controls. Click the logdir to copy
+it, or press `d` to open the board in its own window.
 
 The theme follows the system until you switch it in the sidebar footer.
 The dashboard follows the system's reduced-motion setting.
 
-When mlq is available, the sidebar lists running jobs first, then waiting jobs
-for the open board. Select **Show full queue** or press `Shift`+`Q` to expand
-the list and show job controls in the sidebar. Stop and cancel actions take a
-second click.
+When [mlq](https://github.com/CarsonBurke/mlqueue) is running, the sidebar
+shows running GPU jobs and which boards they belong to. Select **Show full
+queue** or press `Shift`+`Q` to expand the list and its controls inside the
+sidebar. Stop and cancel actions take a second click.
 
 Removing a board unregisters it and leaves its logdir on disk. Use the **Undo**
 toast to restore the registry entry, including its port and comments.
@@ -89,10 +86,8 @@ toast to restore the registry entry, including its port and comments.
 | `Ctrl`+`K` | Search boards, jobs, and actions. `Shift`+`Enter` opens a board in its own window. |
 | `/` | Filter boards. Number shortcuts follow the filtered list. |
 | `1`–`9`, `Ctrl`+`1`–`0` | Open a board |
-| `g` | Show the overview |
 | `w` / `d` / `l` | Close and unload the open board / open it in its own window / view its log |
 | `Shift`+`R` | Reload the open board's pane |
-| `Enter` | Run the primary action on a board's status page |
 | `+` / `Delete` | Add a board / remove the focused board |
 | `q` / `Shift`+`Q` | Fold the sidebar queue / toggle the full list |
 | `[` | Collapse the sidebar to status dots |
