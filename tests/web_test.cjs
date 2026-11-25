@@ -103,6 +103,7 @@ function dashboard(selected = "short", routes = () => undefined) {
         ok: !body.error,
         statusText: "error",
         json: () => Promise.resolve(body),
+        text: () => Promise.resolve(typeof body === "string" ? body : ""),
       }));
     },
   });
@@ -110,8 +111,8 @@ function dashboard(selected = "short", routes = () => undefined) {
   return {
     requests,
     el: (id) => document.getElementById(id),
-    update(boards) {
-      context.payload = { boards, server: { keep_warm: 2 } };
+    update(boards, extra = {}) {
+      context.payload = { boards, server: { keep_warm: 2 }, ...extra };
       vm.runInContext("absorb(payload)", context);
     },
     run: (code) => vm.runInContext(code, context),
@@ -215,11 +216,77 @@ const settle = () => new Promise((resolve) => setImmediate(resolve));
 
 test("a row says what is wrong in the words it has room for", () => {
   const app = dashboard();
-  const status = (fields) => app.run(`shortStatus(${JSON.stringify({ autostart: "always", ...fields })})`);
-  assert.equal(status({ state: "failed", message: "logdir does not exist: /very/long/path/runs" }), "logdir missing");
-  assert.equal(status({ state: "failed", message: "port 6100 is already in use" }), "port 6100 is already in use");
-  assert.equal(status({ state: "stopped", autostart: "on_demand", message: "" }), "on demand");
-  assert.equal(status({ state: "stopped", autostart: "manual", message: "stopped by request" }), "stopped");
+  const summary = (fields) => app.run(`summary(${JSON.stringify({ autostart: "always", port: 6100, ...fields })})`);
+  assert.equal(summary({ state: "failed", message: "logdir does not exist: /very/long/path/runs" }), "Log directory is missing");
+  assert.equal(summary({ state: "failed", message: "port 6100 is already in use" }), "Port 6100 is taken");
+  assert.equal(summary({ state: "failed", message: "cannot start tensorboard: No such file" }), "Can't launch its command");
+  assert.equal(summary({ state: "backoff", last_exit: 1, message: "exited with code 1; retrying in 4s - boom" }),
+    "Crashed (exit 1) · retrying");
+  assert.equal(summary({ state: "backoff", last_exit: -9, message: "exited with code -9; retrying in 60s" }),
+    "Crashed (killed) · retrying");
+  assert.equal(summary({ state: "stopped", autostart: "on_demand", message: "stopped: idle" }), "Asleep · wakes when opened");
+  assert.equal(summary({ state: "stopped", autostart: "manual", message: "stopped on request" }), "Stopped by you");
+  assert.equal(summary({ state: "starting", autostart: "on_demand" }), "Waking up…");
+  assert.equal(summary({ state: "disabled" }), "Disabled in the registry");
+});
+
+test("state words separate a user stop from sleep, and crashing from can't start", () => {
+  const app = dashboard();
+  const word = (fields) => app.run(`stateWord(${JSON.stringify({ autostart: "always", ...fields })})`);
+  assert.equal(word({ state: "stopped", autostart: "on_demand", message: "stopped: idle" }), "Asleep");
+  assert.equal(word({ state: "stopped", autostart: "on_demand", message: "stopped on request" }), "Stopped by you");
+  assert.equal(word({ state: "stopped", message: "" }), "Stopped");
+  assert.equal(word({ state: "backoff" }), "Crashing");
+  assert.equal(word({ state: "failed" }), "Can't start");
+  assert.equal(word({ state: "starting", autostart: "on_demand" }), "Waking up");
+  assert.equal(word({ state: "starting" }), "Starting");
+  assert.equal(app.run(`stateTone({ state: "failed" })`), "bad");
+  assert.equal(app.run(`stateTone({ state: "backoff" })`), "warn");
+});
+
+test("negative exit codes read as signals, and the frozen retry delay is dropped", () => {
+  const app = dashboard();
+  assert.equal(app.run("exitText(-9)"), "killed by SIGKILL");
+  assert.equal(app.run("exitText(-15)"), "killed by SIGTERM");
+  assert.equal(app.run("exitText(-31)"), "killed by signal 31");
+  assert.equal(app.run("exitText(2)"), "exit code 2");
+  const detail = (message) => app.run(`crashDetail(${JSON.stringify({ message })})`);
+  assert.equal(detail("exited with code 1; retrying in 16s - OSError: [Errno 24] Too many open files"),
+    "OSError: [Errno 24] Too many open files");
+  assert.equal(detail("exited with code -9; retrying in 60s"), "");
+  assert.equal(detail("something else"), "something else");
+});
+
+test("hints name what they matched and stay quiet otherwise", () => {
+  const app = dashboard();
+  const titles = (fields, log = "") =>
+    app.run(`hints(${JSON.stringify({ port: 6100, ...fields })}, ${JSON.stringify(log)}).map((h) => h.title)`);
+  assert.deepEqual([...titles({ state: "backoff", last_exit: 1 }, "OSError: [Errno 24] Too many open files")],
+    ["It ran out of open files."]);
+  assert.deepEqual([...titles({ state: "backoff", last_exit: -9 })], ["It was killed by the system."]);
+  assert.deepEqual([...titles({ state: "failed", message: "logdir does not exist: /x" })], ["The log directory is gone."]);
+  assert.deepEqual([...titles({ state: "failed", message: "port 6100 is already in use" })],
+    ["Another program is using port 6100."]);
+  assert.deepEqual([...titles({ state: "backoff", last_exit: 1 }, "ValueError: bad")], []);
+});
+
+test("paths shorten by whole folders", () => {
+  const app = dashboard();
+  assert.equal(app.run('shortPath("~/Documents/repositories/cleanrl/runs")'), "~/…/cleanrl/runs");
+  assert.equal(app.run('shortPath("/data/a/b/c/d")'), "/…/c/d");
+  assert.equal(app.run('shortPath("~/work/runs")'), "~/work/runs");
+});
+
+test("an on-demand board nobody is watching says when it will sleep", () => {
+  const app = dashboard("other");
+  const now = Date.now() / 1000;
+  app.run(`state = { now: ${now}, boards: [], server: { keep_warm: 2 } }`);
+  const sleeps = (fields) => app.run(`sleepsAt(${JSON.stringify({ name: "x", state: "running", autostart: "on_demand",
+    idle_timeout: 900, demanded_ago: 300, ...fields })})`);
+  assert.ok(Math.abs(sleeps({}) - (now + 600)) < 1);
+  assert.equal(sleeps({ autostart: "always" }), null);
+  assert.equal(sleeps({ name: "other" }), null);  // open, so the heartbeat renews it
+  assert.equal(sleeps({ demanded_ago: null }), null);
 });
 
 test("removing a board offers an undo that hands back the server's token", async () => {
@@ -289,6 +356,30 @@ test("a board added from the form opens once the manager reports it", async () =
   app.update([{ name: "fresh", state: "stopped", autostart: "manual", idle_timeout: 900 }]);
   assert.equal(app.run("active"), "fresh");
   assert.equal(app.requests.at(-2).url, "/api/boards/fresh/start");
+});
+
+test("an added board opens even when the stream announced it before the request returned", async () => {
+  let app;
+  app = dashboard("", (method, url) => {
+    if (url !== "/api/boards") return undefined;
+    app.update([{ name: "fresh", state: "stopped", autostart: "on_demand", idle_timeout: 900 }]);
+    return { ok: true, board: "fresh", events: true };
+  });
+  app.update([]);
+  app.el("add-board-path").value = "/x";
+  app.run("submitAddBoard({ preventDefault() {} })");
+  await settle();
+  assert.equal(app.run("active"), "fresh");
+});
+
+test("opening a crashing board does not reset its backoff with a start", () => {
+  const app = dashboard("");
+  app.update([{ ...board("bad", 60, "always"), state: "backoff", restarts: 4 },
+    { ...board("off", 60, "manual"), state: "stopped" }]);
+  app.run('select("bad")');
+  app.run('select("off")');
+  const starts = app.requests.filter(({ url }) => url.endsWith("/start")).map(({ url }) => url);
+  assert.deepEqual(starts, ["/api/boards/off/start"]);
 });
 
 test("a rejected add stays in the dialog with the server's reason", async () => {
@@ -384,19 +475,166 @@ test("holding Enter on the add form registers the logdir once", async () => {
   assert.equal(app.requests.filter(({ url }) => url === "/api/boards").length, 1);
 });
 
-test("every row control is drawn with an icon that exists", () => {
-  const app = dashboard();
-  app.update([board("short", 60), { ...board("idle", 60), state: "stopped" }]);
-  app.run(`state.queue = { connected: true, running: [{ id: 1, name: "job", state: "running",
-    since: 0, boards: ["short"], project: "p", cwd: "/" }], queued: [], active_leases: 1 };
-    render()`);
+const queueOf = (running, queued) => ({ connected: true, running, queued, active_leases: running.length, effective_limit: 2 });
+const job = (id, fields) => ({ id, name: `job${id}`, state: "queued", boards: [], project: "p", cwd: "/", since: 0,
+  queued_at: 0, ...fields });
+
+test("every icon drawn in the sidebar and overview exists", () => {
+  const app = dashboard("short");
+  app.update([board("short", 60), { ...board("idle", 60), state: "stopped" },
+    { ...board("bad", 60, "always"), state: "backoff", last_exit: 1, restarts: 2, message: "exited with code 1; retrying in 4s" }]);
+  app.run(`state.queue = ${JSON.stringify(queueOf([job(1, { state: "running", boards: ["short"] })], [job(2, { state: "held" })]))};
+    render(); active = null; render()`);
   const drawn = [];
   const walk = (node) => {
     if (node.tag === "path") drawn.push(node.attributes.d);
     node.children.forEach(walk);
   };
-  for (const id of ["boards", "queue-jobs", "reload-config", "add-board"]) walk(app.el(id));
-  // 2 rows x (6 controls + the on-demand mark) + 1 queue cancel + 2 header buttons.
-  assert.equal(drawn.length, 17);
+  for (const id of ["boards", "queue-jobs", "add-board", "view", "theme-toggle", "collapse-rail"]) walk(app.el(id));
+  assert.ok(drawn.length > 20, `only ${drawn.length} icons`);
   assert.ok(drawn.every((d) => typeof d === "string" && d.startsWith("M")), drawn.join(" | "));
+});
+
+test("the sidebar queue lists running jobs, then the open board's, then others up to the limit", () => {
+  const app = dashboard("mine");
+  app.update([board("mine", 60, "always"), board("other", 60, "always")]);
+  app.run(`state.server.queue_visible = 4; state.queue = ${JSON.stringify(queueOf(
+    [job(1, { state: "running", boards: ["other"] })],
+    [job(2, { boards: ["other"] }), job(3, { boards: ["other"] }), job(4, { boards: ["mine"] }), job(5, {})],
+  ))}; render()`);
+  const nodes = app.el("queue-jobs").children
+    .map((node) => (node.find((child) => child.className === "jname") || node).textContent);
+  assert.deepEqual(nodes, ["Running", "job1", "mine's jobs", "job4", "Other jobs", "job2", "job3"]);
+  assert.match(app.el("queue-more").text, /1 more/);
+});
+
+test("stopping a job takes a second click, and the first one wears off", async () => {
+  const app = dashboard("", (method, url) => (url.startsWith("/api/queue/") ? { ok: true } : undefined));
+  app.update([]);
+  app.run(`state.queue = ${JSON.stringify(queueOf([job(7, { state: "running" })], []))}`);
+  app.run("cancelJob(7)");
+  assert.equal(app.requests.filter(({ url }) => url.startsWith("/api/queue/")).length, 0);
+  app.advance(3000);
+  app.run("cancelJob(7)");
+  assert.equal(app.requests.filter(({ url }) => url.startsWith("/api/queue/")).length, 0);
+  app.run("cancelJob(7)");
+  await settle();
+  assert.deepEqual(app.requests.filter(({ url }) => url.startsWith("/api/queue/")).map(({ url }) => url),
+    ["/api/queue/7/cancel"]);
+  assert.match(app.el("toasts").text, /Stopping #7 job7/);
+});
+
+test("the open board's mode switch posts the new policy and ignores the current one", () => {
+  const app = dashboard("short");
+  app.update([board("short", 60)]);
+  app.run('setMode("short", "on_demand"); setMode("short", "manual")');
+  const posts = app.requests.filter(({ url }) => url.endsWith("/autostart"));
+  assert.deepEqual(posts.map(({ body }) => body), [{ mode: "manual" }]);
+});
+
+test("a crashing board's page counts down to the next try and hides the frozen delay", () => {
+  const app = dashboard("bad");
+  const next = Date.now() / 1000 + 42;
+  app.update([{ ...board("bad", 60, "always"), state: "backoff", last_exit: -9, restarts: 3, next_attempt: next,
+    message: "exited with code -9; retrying in 8s", target: "/runs", port: 6100, log_path: "/l" }]);
+  app.run("render()");
+  const view = app.el("view");
+  const countdown = view.find((node) => node.dataset.until !== undefined);
+  assert.equal(Number(countdown.dataset.until), next);
+  assert.match(countdown.textContent, /^4[12]s$/);
+  assert.match(view.text, /Killed by SIGKILL3 crashes in a row · next try in/);
+  assert.match(view.text, /killed by the system/);
+  assert.doesNotMatch(view.text, /retrying in 8s/);
+});
+
+test("an on-demand crash says it retries only while open", () => {
+  const app = dashboard("bad");
+  app.update([{ ...board("bad", 60), state: "backoff", last_exit: 1, restarts: 1, message: "exited with code 1; retrying in 2s - boom" }]);
+  app.run("render()");
+  assert.match(app.el("view").text, /retries while the board is open/);
+  assert.match(app.el("view").text, /boom/);
+});
+
+test("the overview is not rebuilt for memory, CPU or queue poll stamps", () => {
+  const app = dashboard("");
+  const running = { ...board("a", 60, "always"), rss_bytes: 1e8, cpu_percent: 1, since: 1, last_event: 5 };
+  const snapshot = queueOf([job(1, { state: "running", since: 1 })], []);
+  app.update([running], { queue: { ...snapshot, updated_at: 1 } });
+  app.run("render()");
+  const page = app.el("view").children[0];
+  assert.ok(page);
+  app.update([{ ...running, rss_bytes: 2e8, cpu_percent: 7, last_event: 9 }], { queue: { ...snapshot, updated_at: 2 } });
+  app.run("render()");
+  assert.equal(app.el("view").children[0], page);
+  // A change in what the page shows still rebuilds it.
+  app.update([{ ...running, state: "backoff", restarts: 1, last_exit: 1, message: "exited with code 1; retrying in 2s" }]);
+  app.run("render()");
+  assert.notEqual(app.el("view").children[0], page);
+});
+
+test("the footer leaves the reconnecting notice once the stream is back", () => {
+  const app = dashboard("");
+  const boards = [{ ...board("a", 60, "always"), rss_bytes: 1e8 }];
+  app.update(boards);
+  app.run("render()");
+  app.run("streamDown = true; render()");
+  assert.match(app.el("totals").text, /Reconnecting/);
+  app.update(boards);
+  app.run("render()");
+  assert.doesNotMatch(app.el("totals").text, /Reconnecting/);
+  assert.match(app.el("totals").text, /1 running/);
+});
+
+test("a slow log answer for an earlier board never replaces the current one", async () => {
+  const pending = [];
+  const app = dashboard("", (method, url) =>
+    (url.includes("/logs") ? new Promise((resolve) => pending.push({ url, resolve })) : undefined));
+  app.update([board("a", 60, "always"), board("b", 60, "always")]);
+  app.run('showLogs("a"); showLogs("b")');
+  pending.find(({ url }) => url.includes("/b/")).resolve("log of b");
+  await settle();
+  pending.find(({ url }) => url.includes("/a/")).resolve("log of a");
+  await settle();
+  assert.equal(app.run("logsText"), "log of b");
+  assert.match(app.el("logs-body").text, /log of b/);
+});
+
+test("a board the user stopped is not woken again by the open pane's heartbeat", () => {
+  const app = dashboard("a");
+  app.update([board("a", 60)]);
+  app.advance(1000);
+  app.update([{ ...board("a", 60), state: "stopped", message: "stopped on request" }]);
+  app.advance(60000);
+  assert.deepEqual(times(app, "a"), [0]);
+});
+
+test("starting an on-demand board wakes it instead of pinning it on", () => {
+  const app = dashboard("");
+  app.update([{ ...board("lazy", 60), state: "stopped", message: "stopped: idle" },
+    { ...board("pinned", 60, "manual"), state: "stopped" }]);
+  app.run('startBoard("lazy"); startBoard("pinned")');
+  const asked = app.requests.filter(({ method }) => method === "POST").map(({ url }) => url);
+  assert.deepEqual(asked, ["/api/boards/lazy/demand", "/api/boards/pinned/start"]);
+});
+
+test("a start timeout reads as a timeout, not as the SIGTERM that ended it", () => {
+  const app = dashboard("slow");
+  const timedOut = { ...board("slow", 60, "always"), state: "backoff", restarts: 1, last_exit: -15,
+    message: "start timed out after 60s", next_attempt: Date.now() / 1000 + 2 };
+  app.update([timedOut]);
+  assert.equal(app.run(`summary(${JSON.stringify(timedOut)})`), "Timed out starting · retrying");
+  app.run("render()");
+  assert.match(app.el("view").text, /Start timed out after 60s/);
+  assert.doesNotMatch(app.el("view").text, /SIGTERM/);
+  // The cause survives the "starting" half of the loop, whose message says nothing about it.
+  const retrying = { ...timedOut, state: "starting", message: "starting: scanning logdir", next_attempt: null };
+  assert.equal(app.run(`summary(${JSON.stringify(retrying)})`), "Timed out starting · retrying");
+});
+
+test("jobs without timestamps show a dash, not a nonsense age", () => {
+  const app = dashboard("");
+  app.update([]);
+  app.run(`state.queue = ${JSON.stringify(queueOf([job(1, { state: "running", since: null })], [job(2, { queued_at: null })]))}`);
+  const text = app.run("queueTable()").text;
+  assert.doesNotMatch(text, /NaN|days/);
 });

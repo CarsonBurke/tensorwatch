@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 import pytest
@@ -142,8 +143,12 @@ def test_quoting_only_when_needed():
 
 
 def test_interface_has_no_orange_accent():
-    """The UI is monochrome plus status colours; no accent chrome."""
-    css = (desktop.ICON_SOURCE.parent / "style.css").read_text()
-    assert "--accent" not in css
-    assert "ff8a3d" not in css.lower()
+    """Orange is TensorBoard's own colour; the one interface accent is indigo."""
+    css = (desktop.ICON_SOURCE.parent / "style.css").read_text().lower()
+    assert "ff8a3d" not in css
     assert "ff8a3d" not in desktop.ICON_SOURCE.read_text().lower()
+    accents = re.findall(r"--accent:\s*(#[0-9a-f]{6})", css)
+    assert accents, "the light and dark themes each define an accent"
+    for accent in accents:
+        r, g, b = (int(accent[i:i + 2], 16) for i in (1, 3, 5))
+        assert b > r and b > g, f"{accent} is not a blue-violet"
