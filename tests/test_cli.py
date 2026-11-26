@@ -124,7 +124,7 @@ def test_list_reports_offline_manager(tmp_path, capsys):
     assert cli.main(["list"]) == 0
     out = capsys.readouterr().out
     assert "BOARD" in out and "c" in out
-    assert "manager not running" in out
+    assert "TensorWatch is not running" in out
 
 
 def test_names_are_qualified_by_their_repository(tmp_path):
@@ -205,24 +205,6 @@ def test_doctor_is_clean_for_a_real_logdir(tmp_path, capsys):
     cli.main(["add", str(tmp_path / "proj" / "runs"), "--name", "e", "--command", "python3"])
     assert cli.main(["doctor"]) == 0
     assert "no problems found" in capsys.readouterr().out
-
-
-def test_service_unit_is_self_contained(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    monkeypatch.setattr(service.shutil, "which", lambda name: None)
-
-    assert cli.main(["install-service", "--no-enable"]) == 0
-    unit = service.unit_path().read_text()
-    assert "ExecStart=" in unit and "-m tensorwatch serve" in unit
-    assert "PYTHONPATH=" in unit
-    assert "%h/.local/bin" in unit  # systemd --user PATH does not include it by default
-    assert "WantedBy=default.target" in unit
-    assert "KillMode=mixed" in unit
-    # A large logdir needs one descriptor per event file; systemd defaults to 1024.
-    assert "LimitNOFILE=65536" in unit
-
-    assert cli.main(["uninstall-service"]) == 0
-    assert not service.unit_path().exists()
 
 
 def test_add_refuses_a_logdir_that_is_already_a_board(tmp_path, capsys):

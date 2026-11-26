@@ -32,7 +32,7 @@ from .config import (
     parse,
     state_dir,
 )
-from .supervisor import Supervisor, probe, raise_file_limit
+from .supervisor import LOG_ROTATE_BYTES, Supervisor, probe, raise_file_limit
 
 # --------------------------------------------------------------------- helpers
 
@@ -50,7 +50,36 @@ def _api(cfg: Config, path: str, method: str = "GET", timeout: float = 5.0) -> A
     return json.loads(body) if body else None
 
 
+def _manager_up(cfg: Config) -> bool:
+    """Whether the manager is running, without starting it to find out.
+
+    While the socket unit listens, any connection to the dashboard port starts
+    the manager, so ask systemd instead. Otherwise probe: a foreground
+    ``serve`` runs outside systemd's knowledge.
+    """
+    if _socket_owns_port():
+        return service.manager_active()
+    return probe(cfg.server.host, cfg.server.port)
+
+
+def _socket_owns_port() -> bool:
+    return service.socket_path().exists() and shutil.which("systemctl") is not None and (
+        service.socket_active()
+    )
+
+
+def _healthy(cfg: Config, timeout: float = 2.0) -> bool:
+    """A real request, not a bare connect: systemd's socket accepts connections
+    while no manager is running, and a request also postpones an idle exit."""
+    try:
+        return bool(_api(cfg, "/healthz", timeout=timeout).get("ok"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, AttributeError):
+        return False
+
+
 def _live_state(cfg: Config) -> dict[str, Any] | None:
+    if not _manager_up(cfg):
+        return None
     try:
         return _api(cfg, "/api/state")
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
@@ -134,7 +163,24 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if args.port:
         cfg = replace(cfg, server=replace(cfg.server, port=args.port))
 
-    if probe(cfg.server.host, cfg.server.port):
+    inherited = service.listen_socket()
+    if inherited is None and _socket_owns_port():
+        # Probing would start the socket's own manager, and this one could not
+        # bind the port anyway.
+        return _fail(
+            "tensorwatch.socket owns the dashboard port; open TensorWatch instead, or run "
+            "`systemctl --user stop tensorwatch.socket` to serve from this terminal"
+        )
+    if inherited is not None:
+        bound = inherited.getsockname()[1]
+        if bound != cfg.server.port:
+            print(
+                f"tensorwatch: warning: the socket unit listens on port {bound} but the "
+                f"registry says {cfg.server.port}; re-run `tensorwatch install-service`",
+                file=sys.stderr,
+            )
+            cfg = replace(cfg, server=replace(cfg.server, port=bound))
+    elif probe(cfg.server.host, cfg.server.port):
         return _fail(
             f"something already listens on {cfg.server.host}:{cfg.server.port} "
             "(another tensorwatch?); stop it or change [server].port"
@@ -211,6 +257,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         ops.restore,
         discover.complete,
         ops.suggest,
+        inherited,
     )
     supervisor.start()
 
@@ -222,6 +269,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         pass
 
     print(f"tensorwatch serving {cfg.dashboard_url} ({len(cfg.boards)} board(s), registry {path})")
+    if args.exit_when_idle:
+        print(f"  exits {cfg.server.idle_exit:.0f}s after the last window closes")
     for spec in cfg.boards:
         print(f"  {spec.name:<20} {spec.url:<24} {spec.target}")
     if args.window:
@@ -236,6 +285,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 print("registry reloaded")
             except ConfigError as exc:
                 print(f"tensorwatch: reload failed: {exc}", file=sys.stderr)
+        if args.exit_when_idle:
+            idle = supervisor.idle_for()
+            if idle >= current["cfg"].server.idle_exit:
+                print(f"no TensorWatch window for {idle:.0f}s; stopping")
+                break
         stop.wait(1.0)
 
     print("tensorwatch shutting down")
@@ -252,6 +306,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _notify_reload(cfg: Config) -> bool:
+    if not _manager_up(cfg):
+        return False  # the next start reads the registry anyway
     try:
         _api(cfg, "/api/reload", method="POST")
         return True
@@ -688,7 +744,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         ])
     print(_table(rows, ["board", "state", "port", "policy", "rss", "cpu", "logdir"]))
     if live is None:
-        print(f"\nmanager not running at {cfg.dashboard_url} (start it with `tensorwatch serve`)")
+        print(f"\nTensorWatch is not running; `tensorwatch open` starts it ({cfg.dashboard_url})")
     else:
         print(f"\ndashboard {cfg.dashboard_url}")
     return 0
@@ -698,7 +754,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     cfg = load()
     live = _live_state(cfg)
     if live is None:
-        return _fail(f"manager not running at {cfg.dashboard_url}")
+        return _fail(f"TensorWatch is not running; `tensorwatch open` starts it ({cfg.dashboard_url})")
     boards = live["boards"]
     if args.name:
         boards = [b for b in boards if b["name"] == args.name]
@@ -717,6 +773,15 @@ def cmd_control(args: argparse.Namespace) -> int:
     cfg = load()
     if cfg.board(args.name) is None:
         return _fail(f"no board {args.name!r} in {cfg.path}")
+    if args.command_name != "start" and not _manager_up(cfg):
+        print(f"TensorWatch is not running, so {args.name} is not either")
+        return 0
+    if args.command_name == "start" and service.installed() and not service.manager_active():
+        print(
+            f"note: TensorWatch stops its boards {cfg.server.idle_exit:.0f}s after the last "
+            f"window closes; `tensorwatch open {args.name}` keeps this one open",
+            file=sys.stderr,
+        )
     try:
         _api(cfg, f"/api/boards/{args.name}/{args.command_name}", method="POST")
     except (urllib.error.URLError, OSError) as exc:
@@ -751,43 +816,82 @@ def cmd_logs(args: argparse.Namespace) -> int:
 
 
 def _ensure_running(cfg: Config, timeout: float = 40.0) -> bool:
-    """Start the systemd unit if the manager is not up, then wait for the port.
+    """Make sure a manager answers on the dashboard port, starting one if needed.
 
-    The desktop launcher goes through here, so clicking the icon must produce a
-    working dashboard even after the service was stopped.
+    The desktop launcher goes through here. Under the socket unit the first
+    request starts the manager. Without it, start a detached manager that exits
+    once no window is open, the same lifetime the socket unit gives it.
     """
-    if probe(cfg.server.host, cfg.server.port):
-        return True
-    if not service.unit_path().exists() or shutil.which("systemctl") is None:
-        print(
-            "manager not running and no systemd unit installed; run `tensorwatch install` "
-            "or `tensorwatch serve`",
-            file=sys.stderr,
-        )
-        return False
-    print("manager not running; starting tensorwatch.service")
-    subprocess.run(["systemctl", "--user", "start", "tensorwatch.service"], check=False)
+    child: subprocess.Popen[bytes] | None = None
+    if service.installed():
+        if not service.socket_active():
+            subprocess.run(["systemctl", "--user", "start", service.SOCKET_NAME], check=False)
+    elif not probe(cfg.server.host, cfg.server.port):
+        child = _spawn_manager()
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if probe(cfg.server.host, cfg.server.port):
+        if _healthy(cfg):
             return True
-        time.sleep(0.4)
-    print(f"tensorwatch.service did not come up within {timeout:.0f}s", file=sys.stderr)
+        if child is not None and child.poll() is not None:
+            print(f"TensorWatch exited with code {child.returncode}; see "
+                  f"{log_dir() / 'manager.log'}", file=sys.stderr)
+            return False
+        time.sleep(0.2)
+    where = ("`journalctl --user -u tensorwatch`" if service.installed()
+             else str(log_dir() / "manager.log"))
+    print(f"TensorWatch did not answer within {timeout:.0f}s; see {where}", file=sys.stderr)
     return False
+
+
+def _spawn_manager() -> subprocess.Popen[bytes]:
+    """Start ``serve --exit-when-idle`` detached from this terminal."""
+    logs = log_dir()
+    logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = logs / "manager.log"
+    if path.exists() and path.stat().st_size > LOG_ROTATE_BYTES:
+        path.replace(path.with_suffix(".log.1"))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "ab") as log:
+        return subprocess.Popen(
+            [sys.executable, "-m", "tensorwatch", "serve", "--exit-when-idle"],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            # Not the caller's directory: `-m` would import from it first, and
+            # the manager would keep it busy for as long as it runs.
+            cwd=state_dir(),
+            start_new_session=True,
+            env={**os.environ, "PYTHONPATH": _package_pythonpath(), "PYTHONUNBUFFERED": "1"},
+        )
+
+
+def _package_pythonpath() -> str:
+    """PYTHONPATH that finds this copy of tensorwatch, as the launcher sets it."""
+    root = str(Path(__file__).resolve().parent.parent)
+    current = os.environ.get("PYTHONPATH")
+    return root if not current else f"{root}{os.pathsep}{current}"
+
+
+def board_page_url(cfg: Config, name: str) -> str:
+    """A board in its own window, served by the dashboard so the window counts as open."""
+    from urllib.parse import quote
+
+    return f"{cfg.dashboard_url}boards/{quote(name, safe='')}"
 
 
 def cmd_open(args: argparse.Namespace) -> int:
     cfg = load()
     url = cfg.dashboard_url
     if args.name:
-        spec = cfg.board(args.name)
-        if spec is None:
+        if cfg.board(args.name) is None:
             return _fail(f"no board {args.name!r}")
-        url = spec.url
+        url = board_page_url(cfg, args.name)
     if not args.no_start:
+        # Open the window even if the start failed: the dashboard shows that
+        # it is offline and reconnects by itself.
         _ensure_running(cfg)
-    elif not probe(cfg.server.host, cfg.server.port):
-        print(f"warning: manager not running at {url}", file=sys.stderr)
+    elif not _manager_up(cfg):
+        print(f"warning: TensorWatch is not running at {cfg.dashboard_url}", file=sys.stderr)
     print(f"opening {url} via {open_window(url, app_mode=not args.tab)}")
     return 0
 
@@ -852,13 +956,21 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return _fail(f"registry invalid: {exc}")
     print(f"state        {state_dir()}")
     print(f"dashboard    {cfg.dashboard_url} "
-          f"{'(running)' if probe(cfg.server.host, cfg.server.port) else '(not running)'}")
+          f"{'(running)' if _manager_up(cfg) else '(not running)'}")
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     print(f"open files   soft {soft}, hard {hard}")
-    unit = service.unit_path()
+    unit = service.socket_path()
     print(f"systemd unit {unit} {'(installed)' if unit.exists() else '(not installed)'}")
     if unit.exists():
         print(f"             {service.unit_state()}")
+        if service.listen_stream(unit.read_text(encoding="utf-8")) != service.listen_address(cfg):
+            problems += 1
+            print(f"  ! the socket does not listen on {service.listen_address(cfg)} from the "
+                  "registry; run `tensorwatch install-service`")
+    elif service.unit_path().exists():
+        problems += 1
+        print(f"  ! {service.unit_path()} is from an older version that runs from login on; "
+              "run `tensorwatch install-service`")
 
     for spec in cfg.boards:
         binary = shutil.which(spec.command[0]) if not os.path.isabs(spec.command[0]) else spec.command[0]
@@ -896,7 +1008,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def board_file_limit() -> int:
     """Descriptors a board process gets with the current configuration."""
-    if service.unit_path().exists() and shutil.which("systemctl") is not None:
+    if service.installed():
         shown = subprocess.run(
             ["systemctl", "--user", "show", "tensorwatch.service", "-p", "LimitNOFILESoft",
              "--value"],
@@ -911,15 +1023,15 @@ def board_file_limit() -> int:
 
 def cmd_service(args: argparse.Namespace) -> int:
     if args.command_name == "install-service":
-        return service.install(enable=not args.no_enable, linger=args.linger)
+        return service.install(load(), enable=not args.no_enable)
     return service.uninstall()
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    """Install everything: the boot service, the launcher entry and `tensorwatch` on PATH."""
+    """Install everything: the socket unit, the launcher entry and `tensorwatch` on PATH."""
     status = 0
     if not args.no_service:
-        status |= service.install(enable=True, linger=not args.no_linger)
+        status |= service.install(load(), enable=True)
     for note in desktop.install():
         print(note)
     cfg = load()
@@ -987,10 +1099,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command_name", required=True)
 
-    p_serve = sub.add_parser("serve", help="run the supervisor and dashboard (foreground)")
+    p_serve = sub.add_parser("serve", help="run the supervisor and dashboard in the foreground")
     p_serve.add_argument("--config", help="registry path (default ~/.config/tensorwatch/config.toml)")
     p_serve.add_argument("--port", type=int, help="override the dashboard port")
     p_serve.add_argument("--window", action="store_true", help="also open a dashboard window")
+    p_serve.add_argument(
+        "--exit-when-idle", action="store_true",
+        help="stop the boards and exit [server] idle_exit seconds after the last window closes")
     p_serve.set_defaults(func=cmd_serve)
 
     p_add = sub.add_parser("add", help="register a logdir")
@@ -1045,7 +1160,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_open.add_argument("name", nargs="?")
     p_open.add_argument("--tab", action="store_true", help="normal browser tab instead of app window")
     p_open.add_argument("--no-start", action="store_true",
-                        help="do not start the service when it is down")
+                        help="do not start TensorWatch when it is not running")
     p_open.set_defaults(func=cmd_open)
 
     p_queue = sub.add_parser("queue", help="show the mlq queue as tensorwatch sees it")
@@ -1062,22 +1177,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor = sub.add_parser("doctor", help="check registry, ports, commands and logdirs")
     p_doctor.set_defaults(func=cmd_doctor)
 
-    p_install = sub.add_parser("install-service", help="install the systemd --user unit")
-    p_install.add_argument("--no-enable", action="store_true", help="write the unit but do not enable")
-    p_install.add_argument("--linger", action="store_true",
-                           help="also enable-linger so boards start at boot without a login")
+    p_install = sub.add_parser(
+        "install-service", help="install the systemd --user socket that starts TensorWatch on use")
+    p_install.add_argument("--no-enable", action="store_true", help="write the units but do not enable")
+    # Boot-time start is gone; accept the old flag so existing scripts keep working.
+    p_install.add_argument("--linger", action="store_true", help=argparse.SUPPRESS)
     p_install.set_defaults(func=cmd_service)
 
-    p_uninstall = sub.add_parser("uninstall-service", help="remove the systemd --user unit")
+    p_uninstall = sub.add_parser("uninstall-service", help="remove the systemd --user units")
     p_uninstall.set_defaults(func=cmd_service)
 
-    p_app = sub.add_parser("install", help="install the boot service, the app launcher and `tensorwatch` on PATH")
-    p_app.add_argument("--no-service", action="store_true", help="skip the systemd unit")
-    p_app.add_argument("--no-linger", action="store_true",
-                       help="do not enable-linger (boards then start at first login)")
+    p_app = sub.add_parser(
+        "install", help="install the systemd socket, the app launcher and `tensorwatch` on PATH")
+    p_app.add_argument("--no-service", action="store_true", help="skip the systemd units")
+    p_app.add_argument("--no-linger", action="store_true", help=argparse.SUPPRESS)
     p_app.set_defaults(func=cmd_install)
 
-    p_app_rm = sub.add_parser("uninstall", help="remove the app launcher and the systemd unit")
+    p_app_rm = sub.add_parser("uninstall", help="remove the app launcher and the systemd units")
     p_app_rm.add_argument("--keep-service", action="store_true")
     p_app_rm.set_defaults(func=cmd_uninstall)
 

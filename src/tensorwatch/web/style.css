@@ -587,3 +587,16 @@ dialog .row { display: flex; justify-content: flex-end; gap: 8px; }
 }
 .palette { animation: fade-in var(--motion-fast) ease; }
 dialog[open]::backdrop { animation: fade-in var(--motion-panel) ease; }
+
+/* A board in its own window (board.html). */
+body.solo { display: block; position: relative; }
+body.solo iframe.pane { position: fixed; }
+.solo-status { max-width: 520px; margin: 18vh auto 0; padding: 0 24px; }
+.solo-status h1 { font-size: 17px; font-weight: 600; margin: 0 0 6px; }
+.solo-status p { margin: 0 0 14px; overflow-wrap: anywhere; }
+.solo-actions { display: flex; gap: 8px; }
+.solo-actions a.btn { text-decoration: none; display: inline-flex; align-items: center; }
+.solo-banner {
+  position: fixed; top: 10px; left: 50%; transform: translateX(-50%); z-index: 2;
+  padding: 6px 12px; border-radius: 8px; background: var(--toast); color: #fff; font-size: 12.5px;
+}

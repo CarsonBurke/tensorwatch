@@ -6,7 +6,7 @@ publishes a status snapshot to subscribers (the dashboard's SSE stream), which
 keeps the browser from polling.
 
 Cold-start behaviour is deliberate: TensorBoard walks its whole logdir on start,
-so spawning every board at once turns login into an I/O storm.  Starts are
+so spawning every board at once turns opening TensorWatch into an I/O storm.  Starts are
 staggered and the number of simultaneously warming boards is capped.
 """
 
@@ -31,7 +31,7 @@ from .config import BoardSpec, Config, log_dir
 from . import activity, procstats
 
 #: Log files are truncated-by-rotation at this size; TensorBoard is chatty on
-#: reload errors and these logs live forever under a systemd unit.
+#: reload errors, and a board can stay up for as long as a window is open.
 LOG_ROTATE_BYTES = 8 * 1024 * 1024
 #: Consecutive failed connect() probes tolerated on a live process before restart.
 UNHEALTHY_STRIKES = 3
@@ -177,6 +177,9 @@ class Supervisor:
         self._last_spawn = 0.0
         self._last_stats = 0.0
         self._last_publish = 0.0
+        #: When the manager last had a reason to stay up: a dashboard dropping
+        #: its stream, or any control request (a CLI call counts as a visitor).
+        self._last_seen = time.monotonic()
         self._pending_config: Config | None = None
         self._snapshot: tuple[BoardStatus, ...] = ()
         self._activity: Mapping[str, Any] = {}
@@ -193,6 +196,22 @@ class Supervisor:
         """Number of connected dashboards (SSE subscribers)."""
         with self._lock:
             return len(self._subscribers)
+
+    def touch(self) -> None:
+        """Note a control request, so a CLI call does not race the idle exit."""
+        with self._lock:
+            self._last_seen = time.monotonic()
+
+    def idle_for(self) -> float:
+        """Seconds since the last dashboard disconnected or request arrived.
+
+        Zero while any dashboard is connected: an open window, even a hidden
+        one, is what keeps the manager and its boards alive.
+        """
+        with self._lock:
+            if self._subscribers:
+                return 0.0
+            return max(0.0, time.monotonic() - self._last_seen)
 
     def publish(self) -> None:
         """Push a state frame without touching child state.
@@ -216,8 +235,7 @@ class Supervisor:
         self._wake.set()
         if self._thread.is_alive():
             self._thread.join(timeout)
-        for runtime in self._boards.values():
-            self._terminate(runtime, "manager shutting down")
+        self._terminate_all("manager shutting down")
 
     # ------------------------------------------------------------------ queries
 
@@ -277,6 +295,7 @@ class Supervisor:
     def unsubscribe(self, channel: queue.Queue[str]) -> None:
         with self._lock:
             self._subscribers.discard(channel)
+            self._last_seen = time.monotonic()
 
     # -------------------------------------------------------------- internals
 
@@ -330,8 +349,7 @@ class Supervisor:
                 self._note_error(exc)
             self._wake.wait(self.config.server.poll_interval)
             self._wake.clear()
-        for runtime in self._boards.values():
-            self._terminate(runtime, "manager shutting down")
+        self._terminate_all("manager shutting down")
         self._refresh_snapshot(force=True)
 
     def _note_error(self, exc: Exception) -> None:
@@ -564,7 +582,7 @@ class Supervisor:
     def _rotate_live_logs(self) -> None:
         """Trim the log of a long-running board without disturbing its writer.
 
-        Boards under systemd run for weeks, so rotation cannot only happen at
+        A board can stay up for days behind an open window, so rotation cannot only happen at
         spawn.  The handle is ``O_APPEND`` in both the manager and the child, so
         keeping the tail and truncating in place is safe for both writers.
         """
@@ -596,6 +614,20 @@ class Supervisor:
             except OSError:
                 pass
             runtime.log = None
+
+    def _terminate_all(self, reason: str) -> None:
+        """Stop every board, signalling all of them before waiting on any.
+
+        Sequential stops would add up their grace periods, and a manager going
+        down holds the dashboard port (or the socket's queued connections) for
+        that whole time.
+        """
+        for runtime in self._boards.values():
+            proc = runtime.proc
+            if proc is not None and proc.poll() is None:
+                self._signal_group(proc, signal.SIGTERM)
+        for runtime in self._boards.values():
+            self._terminate(runtime, reason)
 
     def _terminate(self, runtime: _Runtime, reason: str) -> None:
         proc = runtime.proc
@@ -739,6 +771,7 @@ class Supervisor:
                     "port": server.port,
                     "config_path": str(self._config.path),
                     "queue_visible": self._config.queue.visible,
+                    "idle_exit": server.idle_exit,
                 },
                 "now": time.time(),
             },

@@ -1,8 +1,8 @@
 """Desktop integration: an application launcher entry, an icon, and `tensorwatch` on PATH.
 
 The launcher runs ``tensorwatch open``, which starts the manager if it is not running
-and then opens the dashboard in its own window, so the entry behaves like an
-ordinary desktop app even though the boards live in a systemd user service.
+and then opens the dashboard in its own window. The manager exits once no window
+is open, so the entry behaves like an ordinary desktop app.
 """
 
 from __future__ import annotations

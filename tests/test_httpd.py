@@ -567,3 +567,23 @@ def test_registry_endpoints_are_unavailable_without_hooks(stack):
     assert call(f"{base}/api/boards", "POST", {"undo": "token"})[0] == 501
     assert call(f"{base}/api/paths?prefix=/")[0] == 501
     assert call(f"{base}/api/suggestions")[0] == 501
+
+
+def test_a_board_window_is_a_dashboard_page(stack):
+    base, supervisor, _ = stack
+    status, headers, body = fetch(f"{base}/boards/fake")
+    assert status == 200 and headers["Content-Type"].startswith("text/html")
+    assert b'src="/static/board.js"' in body
+    # It must not be framable either: it drives the same unauthenticated API.
+    assert headers["X-Frame-Options"] == "DENY"
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        fetch(f"{base}/boards/fake/extra")
+    assert caught.value.code == 404
+
+
+def test_every_request_postpones_the_idle_exit(stack):
+    base, supervisor, _ = stack
+    time.sleep(0.1)
+    assert supervisor.idle_for() >= 0.1
+    fetch(f"{base}/healthz")
+    assert supervisor.idle_for() < 0.1

@@ -41,7 +41,7 @@ DEFAULT_SERVER_PORT: Final = 6005
 DEFAULT_PORT_BASE: Final = 6100
 DEFAULT_COMMAND: Final = ("tensorboard",)
 
-#: ``always``    - start with the manager, restart forever (the reboot case).
+#: ``always``    - run whenever the manager runs, restarting after a crash.
 #: ``on_demand`` - start when the dashboard opens the board, stop when idle.
 #: ``manual``    - only ever started by an explicit request.
 AUTOSTART_MODES: Final = ("always", "on_demand", "manual")
@@ -184,6 +184,10 @@ class ServerSpec:
     #: address; without it such a config is rejected instead of silently exposing
     #: unauthenticated TensorBoards on the network.
     allow_remote: bool = False
+    #: Seconds the manager keeps running after the last TensorWatch window
+    #: closes, when it was started on demand (``serve --exit-when-idle``).  The
+    #: grace covers a reload or a quick close and reopen; the boards stop with it.
+    idle_exit: float = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,7 +382,7 @@ def _queue_from(raw: Mapping[str, Any]) -> QueueSpec:
 def _server_from(raw: Mapping[str, Any]) -> ServerSpec:
     reader = _Reader(raw, "server")
     reader.unknown(("host", "port", "port_base", "keep_warm", "start_stagger",
-                    "max_warming", "poll_interval", "allow_remote"))
+                    "max_warming", "poll_interval", "allow_remote", "idle_exit"))
     port = reader.int_("port", DEFAULT_SERVER_PORT) or DEFAULT_SERVER_PORT
     if port in UNSAFE_PORTS:
         raise ConfigError(f"server.port {port} is blocked by browsers")
@@ -398,6 +402,7 @@ def _server_from(raw: Mapping[str, Any]) -> ServerSpec:
         max_warming=max(1, reader.int_("max_warming", 2) or 2),
         poll_interval=max(0.25, reader.float_("poll_interval", 2.0)),
         allow_remote=allow_remote,
+        idle_exit=max(1.0, reader.float_("idle_exit", 120.0)),
     )
 
 

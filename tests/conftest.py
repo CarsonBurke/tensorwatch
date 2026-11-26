@@ -55,6 +55,9 @@ def home(tmp_path, monkeypatch):
     """Isolate registry + state directories."""
     monkeypatch.setenv("TENSORWATCH_CONFIG", str(tmp_path / "config.toml"))
     monkeypatch.setenv("TENSORWATCH_STATE_DIR", str(tmp_path / "state"))
+    # Keep the real systemd units out of reach: their presence changes how the
+    # CLI decides whether the manager is running.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     return tmp_path
 
 

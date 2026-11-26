@@ -2,7 +2,8 @@
 
 Keep your projects' TensorBoards in one window. Register each project's log
 directory once, then pick a board from the sidebar to open its charts.
-TensorWatch runs locally on Linux and manages the TensorBoard processes.
+TensorWatch runs locally on Linux and manages the TensorBoard processes. It
+runs only while one of its windows is open.
 
 **Light**
 
@@ -25,10 +26,17 @@ bin/tensorwatch install
 bin/tensorwatch open
 ```
 
-`install` enables a systemd user service, enables linger so the service can start
-before you sign in, and installs an app launcher and a `tensorwatch` command in
-`~/.local/bin`. The dashboard is at <http://127.0.0.1:6005/> by default. To run
-in the foreground without installing the service, use `bin/tensorwatch serve`.
+`install` enables a systemd user socket on the dashboard port, and installs an
+app launcher and a `tensorwatch` command in `~/.local/bin`. The dashboard is at
+<http://127.0.0.1:6005/> by default.
+
+The first connection to the dashboard port starts TensorWatch. That connection
+can come from the launcher, a bookmark, or the CLI. TensorWatch stops its boards
+and exits two minutes after the last window closes. Set `[server] idle_exit` in
+seconds to change the delay. Without systemd, `tensorwatch open` starts
+TensorWatch in the background, and it exits the same way. To keep TensorWatch
+running until you stop it, run `bin/tensorwatch serve` in a terminal. If the
+socket is installed, stop it first with `systemctl --user stop tensorwatch.socket`.
 
 ### Add boards
 
@@ -56,7 +64,7 @@ Agents working in this checkout can use the
 
 | Policy | When it runs |
 | --- | --- |
-| **Always** | Starts with the service and retries after a crash. Default. |
+| **Always** | Starts when TensorWatch starts and retries after a crash. Default. |
 | **On demand** | Starts when a dashboard pane opens it and stops after 15 minutes idle by default. |
 | **Manual** | Starts when you open it, press Start, or run `tensorwatch start NAME`. |
 
@@ -68,7 +76,10 @@ registry. Use **On demand** for archives you open occasionally.
 
 Pick a board in the sidebar or press its number to switch to it. The selected
 row shows the logdir, port, run policy, and controls. Click the logdir to copy
-it, or press `d` to open the board in its own window.
+it, or press `d` to open the board in its own window. That window also keeps
+TensorWatch running, so you can close the dashboard and keep the board open.
+A browser tab pointed straight at a board's port does not keep TensorWatch
+running, so the board stops when the last TensorWatch window closes.
 
 The theme follows the system until you switch it in the sidebar footer.
 The dashboard follows the system's reduced-motion setting.
@@ -97,7 +108,10 @@ toast to restore the registry entry, including its port and comments.
 
 The registry lives at `~/.config/tensorwatch/config.toml`. Commands such as
 `add`, `rm`, and `set` preserve comments when they edit it. After a manual edit,
-press `r` in the dashboard or run `systemctl --user reload tensorwatch`.
+press `r` in the dashboard or run `systemctl --user reload tensorwatch`. If
+TensorWatch is not running, it reads the edit when it next starts. After you
+change `[server] port`, run `tensorwatch install-service` so the socket listens
+on the new port.
 
 ```toml
 [server]
@@ -121,7 +135,7 @@ the old port.
 Board settings include `logdir_spec`, `samples_per_plugin`, `args`, `command`,
 `cwd`, `env`, `description`, `enabled`, and `idle_timeout`. The dashboard keeps
 two TensorBoard panes mounted by default. Set `[server] keep_warm` to change it.
-Set `[queue] enabled = false` and restart the service to hide mlq.
+Set `[queue] enabled = false` and restart TensorWatch to hide mlq.
 
 ## CLI reference
 
@@ -136,8 +150,8 @@ Set `[queue] enabled = false` and restart the service to hide mlq.
 | `logs NAME [-f]` | Read or follow a board's TensorBoard output |
 | `open [NAME]` | Open the dashboard or a board in an app window |
 | `queue` | Show the mlq queue as TensorWatch sees it |
-| `install` / `uninstall` | Manage the user service and launcher |
-| `serve` | Run the supervisor and dashboard in the foreground |
+| `install` / `uninstall` | Manage the systemd socket and the launcher |
+| `serve` | Run TensorWatch in the foreground until you stop it |
 | `doctor` | Check registry settings, ports, commands, and logdirs |
 
 Run `tensorwatch <command> --help` for flags.
@@ -145,7 +159,10 @@ Run `tensorwatch <command> --help` for flags.
 ## Troubleshooting
 
 - Run `tensorwatch doctor` if a board cannot start. Read board logs with
-  `tensorwatch logs NAME` and service logs with `journalctl --user -u tensorwatch`.
+  `tensorwatch logs NAME`. Read TensorWatch's own log with
+  `journalctl --user -u tensorwatch`, or in
+  `~/.local/state/tensorwatch/logs/manager.log` if TensorWatch runs without
+  systemd.
 - For boards with thousands of event files, check the file descriptor limit.
   The installed service sets `LimitNOFILE=65536`. A low limit can leave
   TensorBoard showing “No dashboards are active for the current data set.”
