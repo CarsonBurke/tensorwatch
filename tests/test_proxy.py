@@ -217,7 +217,7 @@ def _fake_board() -> FakeBoard:
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     board = FakeBoard(server)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
     return board
 
 
@@ -428,10 +428,11 @@ def test_cross_origin_api_requests_are_refused_unread(boards):
         sock.sendall(b"POST /api/reload HTTP/1.1\r\nHost: localhost:%d\r\nOrigin: http://evil.example\r\n"
                      b"Content-Length: 67108864\r\n\r\n" % port)
         assert sock.recv(4096).startswith(b"HTTP/1.1 403")
-    # And the dashboard's own requests are small.
-    response, _ = request(port, "localhost", path="/api/reload", method="POST", body=b"x" * (2 << 20),
-                          headers={"Origin": f"http://localhost:{port}"})
-    assert response.status == 413
+    # And the dashboard's own requests are small: refused from the header alone.
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        sock.sendall(b"POST /api/reload HTTP/1.1\r\nHost: localhost:%d\r\nOrigin: http://localhost:%d\r\n"
+                     b"Content-Length: %d\r\n\r\n" % (port, port, 2 << 20))
+        assert sock.recv(4096).startswith(b"HTTP/1.1 413")
 
 
 def test_a_get_with_a_body_closes_the_connection(boards):
