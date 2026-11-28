@@ -21,6 +21,7 @@ manager relays them to its TensorBoard (see :mod:`tensorwatch.proxy`).
 from __future__ import annotations
 
 import collections
+import itertools
 import json
 import os
 import shutil
@@ -215,6 +216,10 @@ def request(
     if response.will_close:
         conn.close()
     else:
+        # The pool is shared with board relays, which need the long timeout.
+        conn.timeout = proxy.READ_TIMEOUT
+        if conn.sock is not None:
+            conn.sock.settimeout(proxy.READ_TIMEOUT)
         upstream.release(conn)
     return response.status, body
 
@@ -231,6 +236,8 @@ def _shift(payload: dict[str, Any], offset: float) -> None:
                 board[key] += offset
     snapshot = payload.get("queue")
     if isinstance(snapshot, dict):
+        if isinstance(snapshot.get("updated_at"), (int, float)):
+            snapshot["updated_at"] += offset
         for job in (*(snapshot.get("running") or ()), *(snapshot.get("queued") or ())):
             for key in _JOB_TIMES:
                 if isinstance(job.get(key), (int, float)):
@@ -263,6 +270,10 @@ class RemoteLink:
             target=self._run, name=f"tensorwatch-remote-{spec.name}", daemon=True
         )
         self._master: subprocess.Popen[bytes] | None = None
+        #: The remote's last state as it sent it, to tell real changes apart.
+        self._received: dict[str, Any] | None = None
+        #: Seconds to add to the remote's timestamps to read them on this clock.
+        self._offset = 0.0
         #: The master's current forward, as (host, port).
         self._forward: tuple[str, int] | None = None
         self._stderr: collections.deque[str] = collections.deque(maxlen=40)
@@ -286,12 +297,20 @@ class RemoteLink:
         self._thread.start()
 
     def shutdown(self, timeout: float = 5.0) -> None:
-        self._stopping.set()
-        self._wake.set()
-        self._close_stream()
+        self.stop()
         if self._thread.is_alive():
             self._thread.join(timeout)
         self._teardown()
+
+    def stop(self) -> None:
+        """Begin shutting down without waiting: end the stream and the master,
+        which also ends any SSH command the link thread is waiting on."""
+        self._stopping.set()
+        self._wake.set()
+        self._close_stream()
+        master = self._master
+        if master is not None and master.poll() is None:
+            master.terminate()
 
     def retry(self) -> None:
         """Try again now instead of after the backoff."""
@@ -391,7 +410,13 @@ class RemoteLink:
         return root / f"{self._stem}.ssh", root / f"{self._stem}.sock"
 
     def _connect(self) -> None:
-        self._set(state="connecting")
+        # A retry asked for while connecting is this attempt; and whatever
+        # served the last connection is no longer to be used.
+        self._retry.clear()
+        previous = self.upstream
+        self._set(state="connecting", upstream=None)
+        if previous is not None:
+            previous.close()
         control, forwarded = self._paths()
         ssh = SSH(self.spec.ssh, control, self._ssh_binary)
         if self._master is None or self._master.poll() is not None:
@@ -410,7 +435,7 @@ class RemoteLink:
             raise classify_ssh(result.returncode, result.stderr or self._stderr_text())
         self._forward = target
         upstream = proxy.Upstream(path=str(forwarded))
-        started = time.monotonic()
+        started, sent = time.monotonic(), time.time()
         try:
             status, body = request(upstream, "GET", "/api/state")
         except OSError as exc:
@@ -423,12 +448,18 @@ class RemoteLink:
         if not isinstance(payload.get("api"), int) or payload["api"] < MIN_API:
             upstream.close()
             raise LinkError(TOO_OLD, "its TensorWatch is older than its hello said; restart it")
+        latency = time.monotonic() - started
         idle_exit = (payload.get("server") or {}).get("idle_exit") or 120.0
         self._ping_interval = max(1.0, min(PING_INTERVAL, float(idle_exit) / 4))
         self._failures = 0
+        # The remote said "now" about halfway through the round trip. Measured
+        # once per connection: per frame, delivery delays would make it jitter.
+        offset = sent + latency / 2 - float(payload.get("now") or sent + latency / 2)
+        self._offset = offset if abs(offset) > SKEW_TOLERANCE else 0.0
+        self._received = None
         with self._lock:
             self.hello = hello
-            self.latency = time.monotonic() - started
+            self.latency = latency
         self._absorb(payload, publish=False)
         self._set(state="connected", error=None, next_attempt=None, upstream=upstream,
                   since=time.time())
@@ -447,9 +478,14 @@ class RemoteLink:
     def _start_master(self, ssh: SSH, control: Path) -> None:
         control.unlink(missing_ok=True)
         self._stderr.clear()
+        argv = ssh.master()
+        if _SETPRIV:
+            # Should this manager die without tearing down, the master goes too,
+            # instead of holding a connection open with nobody to use it.
+            argv = [_SETPRIV, "--pdeathsig", "TERM", "--", *argv]
         try:
             master = subprocess.Popen(
-                ssh.master(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE, start_new_session=True,
             )
         except FileNotFoundError as exc:
@@ -577,10 +613,23 @@ class RemoteLink:
                 self.latency = time.monotonic() - started
 
     def _absorb(self, payload: dict[str, Any], publish: bool = True) -> None:
-        offset = time.time() - float(payload.get("now") or time.time())
-        if abs(offset) > SKEW_TOLERANCE:
-            _shift(payload, offset)
-        kept = {key: payload.get(key) for key in ("boards", "queue", "server")}
+        received = {key: payload.get(key) for key in ("boards", "queue", "server")}
+        if received == self._received:
+            # Nothing new: the remote republished for its own reasons, such as
+            # its remotes changing. Passing it on would let two machines that
+            # list each other echo frames back and forth without end.
+            return
+        self._received = received
+        kept = json.loads(json.dumps(received))
+        # Each board's address comes from the remote; only a DNS label may
+        # become part of a host name here.
+        kept["boards"] = [
+            board for board in kept.get("boards") or ()
+            if isinstance(board, dict) and isinstance(board.get("host"), str)
+            and proxy.LABEL_RE.match(board["host"])
+        ]
+        if self._offset:
+            _shift(kept, self._offset)
         with self._lock:
             self.remote = kept
         if publish:
@@ -637,6 +686,9 @@ def _wait_for(
     return path.exists()
 
 
+_SETPRIV = shutil.which("setpriv")
+
+
 def default_ssh() -> str:
     """The ssh client; ``TENSORWATCH_SSH`` overrides it (the tests use a fake)."""
     return os.environ.get("TENSORWATCH_SSH") or shutil.which("ssh") or "ssh"
@@ -656,6 +708,8 @@ class Federation:
         self._present = present
         self._ssh = ssh or default_ssh()
         self._links: dict[str, RemoteLink] = {}
+        #: Links removed by a reload that are still shutting down.
+        self._stopping: list[RemoteLink] = []
         self._lock = threading.Lock()
         self.update(specs)
 
@@ -669,7 +723,13 @@ class Federation:
             return list(self._links.values())
 
     def update(self, specs: Iterable[RemoteSpec]) -> None:
-        """Follow a registry reload: start, stop or restart links as needed."""
+        """Follow a registry reload: start, stop or restart links as needed.
+
+        Returns at once: a link can take seconds to stop (an SSH command in
+        flight), and a reload must not wait on it. A replacement for a link
+        being stopped starts once the old one is gone, since both use the
+        same socket paths.
+        """
         wanted = {spec.name: spec for spec in specs}
         stale: list[RemoteLink] = []
         fresh: list[RemoteLink] = []
@@ -685,12 +745,32 @@ class Federation:
                     fresh.append(link)
                 ordered[name] = link
             self._links = ordered
+            self._stopping.extend(stale)
         for link in stale:
-            link.shutdown()
+            link.stop()
+        replacing = {link.spec.name for link in stale}
         for link in fresh:
-            link.start()
+            if link.spec.name not in replacing:
+                link.start()
+        if stale:
+            later = [link for link in fresh if link.spec.name in replacing]
+            threading.Thread(
+                target=self._replace, args=(stale, later), name="tensorwatch-remote-reload",
+                daemon=True,
+            ).start()
         if stale or fresh:
             self._publish()
+
+    def _replace(self, stale: list[RemoteLink], fresh: list[RemoteLink]) -> None:
+        for link in stale:
+            link.shutdown()
+        with self._lock:
+            for link in stale:
+                if link in self._stopping:
+                    self._stopping.remove(link)
+            current = [link for link in fresh if self._links.get(link.spec.name) is link]
+        for link in current:
+            link.start()
 
     def nudge(self) -> None:
         for link in self.links:
@@ -700,12 +780,12 @@ class Federation:
         return [link.to_json() for link in self.links]
 
     def shutdown(self) -> None:
-        links = self.links
         with self._lock:
+            links = [*self._links.values(), *self._stopping]
             self._links = {}
+        # All at once: each may be waiting on an SSH command.
         for link in links:
-            link._stopping.set()
-            link._wake.set()
+            link.stop()
         for link in links:
             link.shutdown()
 
@@ -734,6 +814,8 @@ def check(spec: RemoteSpec, ssh: str | None = None, timeout: float = 120.0) -> d
 def summarize(remote: Mapping[str, Any]) -> str:
     """One line about a remote's state, for the CLI."""
     state = remote.get("state")
+    if state == "idle":
+        return "not connected (connects while a TensorWatch window is open)"
     if state == "connected":
         boards = remote.get("boards") or []
         running = sum(1 for board in boards if board.get("state") == "running")

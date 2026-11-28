@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import time
 import http.client
 import urllib.error
@@ -344,22 +345,21 @@ def test_missing_host_header_is_refused(stack):
     conn.close()
 
 
-def test_rejected_post_keeps_the_connection_usable(stack):
-    """A 403 must consume the body, or the next request on the socket desyncs."""
-    base, _, _ = stack
+def test_a_rejected_post_never_reads_its_body_as_a_request(stack):
+    """A refused request is answered unread and the connection closed: its body
+    must not be buffered for a page elsewhere, nor parsed as the next request."""
+    base, supervisor, _ = stack
     host, port = base.removeprefix("http://").split(":")
-
-
-    conn = http.client.HTTPConnection(host, int(port), timeout=10)
-    conn.request("POST", "/api/boards/fake/stop", body=b'{"x":1}',
-                 headers={"Origin": "http://evil.example", "Content-Type": "application/json"})
-    first = conn.getresponse()
-    assert first.status == 403
-    first.read()
-    conn.request("GET", "/healthz")
-    second = conn.getresponse()
-    assert second.status == 200 and json.loads(second.read())["ok"] is True
-    conn.close()
+    smuggled = b"POST /api/reload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+    with socket.create_connection((host, int(port)), timeout=5) as sock:
+        sock.sendall(
+            b"POST /api/boards/fake/stop HTTP/1.1\r\nHost: %s:%s\r\nOrigin: http://evil.example\r\n"
+            b"Content-Length: %d\r\n\r\n" % (host.encode(), port.encode(), len(smuggled)) + smuggled
+        )
+        received = b""
+        while chunk := sock.recv(65536):
+            received += chunk
+    assert received.startswith(b"HTTP/1.1 403") and received.count(b"HTTP/1.1") == 1
 
 
 def test_healthz(stack):

@@ -169,6 +169,17 @@ def _fake_board() -> FakeBoard:
             if self.path == "/redirect":
                 host = self.headers["Host"]
                 return self._send(302, b"", [("Location", f"http://{host}/ok")])
+            if self.path == "/bad-redirect":
+                return self._send(302, b"", [("Location", "http://[x/ok")])
+            if self.path == "/early-hints":
+                self.wfile.write(b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>\r\n\r\n")
+                return self._send(200, b"final")
+            if self.path == "/plus-length":
+                self.send_response(200)
+                self.send_header("Content-Length", "+3")
+                self.end_headers()
+                self.wfile.write(b"abc")
+                return
             if self.path == "/stream":
                 # A body that ends with the connection, written in two parts.
                 self.send_response(200)
@@ -357,10 +368,9 @@ def test_cross_site_reads_of_a_board_are_refused(boards):
                              headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate",
                                       "Sec-Fetch-Dest": "iframe"})
     assert (response.status, body) == (200, b"ok")
-    # Only pages on this machine may frame it.
+    # Only the dashboard on this port may frame it; CSP has no IPv6 literals.
     policy = response.getheader("Content-Security-Policy")
-    assert policy and "frame-ancestors" in policy and "http://localhost:*" in policy
-    assert "evil" not in policy
+    assert policy == f"frame-ancestors 'self' http://localhost:{port} http://127.0.0.1:{port}"
 
 
 def test_post_bodies_and_compressed_responses_pass_through_untouched(boards):
@@ -383,6 +393,52 @@ def test_post_bodies_and_compressed_responses_pass_through_untouched(boards):
     response, body = request(port, "cleanrl.localhost", path="/big", method="HEAD")
     assert response.status == 200 and body == b""
     assert response.getheader("Content-Length") == str(len(BIG))
+
+
+def _raw(port: int, data: bytes) -> bytes:
+    """Send raw bytes; everything the server answers until it closes."""
+    with socket.create_connection(("127.0.0.1", port), timeout=1) as sock:
+        sock.sendall(data)
+        received = b""
+        try:
+            while chunk := sock.recv(65536):
+                received += chunk
+        except socket.timeout:
+            pass
+    return received
+
+
+@pytest.mark.parametrize("host", ["nothing.localhost", "x.down.localhost", "x.unknown.localhost"])
+def test_a_body_is_never_read_as_the_next_request(boards, host):
+    """An error answered before the body was read would leave the body to be
+    parsed as a request of its own, which no check has seen."""
+    port = boards["port"]
+    smuggled = (b"POST /api/reload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+                b"GET /api/state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+    request_ = (b"POST /data HTTP/1.1\r\nHost: %s:%d\r\nContent-Length: %d\r\n\r\n"
+                % (host.encode(), port, len(smuggled)) + smuggled)
+    received = _raw(port, request_)
+    assert received.count(b"HTTP/1.1 ") == 1, received[:400]
+
+
+def test_cross_origin_api_requests_are_refused_unread(boards):
+    """A page elsewhere cannot make the dashboard buffer a large body."""
+    port = boards["port"]
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+        sock.sendall(b"POST /api/reload HTTP/1.1\r\nHost: localhost:%d\r\nOrigin: http://evil.example\r\n"
+                     b"Content-Length: 67108864\r\n\r\n" % port)
+        assert sock.recv(4096).startswith(b"HTTP/1.1 403")
+    # And the dashboard's own requests are small.
+    response, _ = request(port, "localhost", path="/api/reload", method="POST", body=b"x" * (2 << 20),
+                          headers={"Origin": f"http://localhost:{port}"})
+    assert response.status == 413
+
+
+def test_a_get_with_a_body_closes_the_connection(boards):
+    port = boards["port"]
+    received = _raw(port, b"GET /healthz HTTP/1.1\r\nHost: localhost:%d\r\nContent-Length: 50\r\n\r\n"
+                    b"GET /api/state HTTP/1.1\r\nHost: localhost\r\n\r\n" % port)
+    assert received.count(b"HTTP/1.1 ") == 1
 
 
 def test_a_chunked_request_body_is_refused_rather_than_misread(boards):
@@ -495,6 +551,20 @@ def test_a_remote_board_is_relayed_through_its_link(boards):
     response, _ = request(port, "gpu-runs.gpu.localhost", path="/redirect")
     assert response.status == 302
     assert response.getheader("Location") == f"http://gpu-runs.gpu.localhost:{port}/ok"
+
+
+def test_odd_upstream_responses_are_not_passed_on_as_is(boards):
+    port = boards["port"]
+    # An interim response is not the answer, nor is the connection reusable.
+    response, _ = request(port, "cleanrl.localhost", path="/early-hints")
+    assert response.status == 502
+    assert request(port, "cleanrl.localhost")[1] == b"ok"
+    # A length only a lenient parser accepts is not forwarded verbatim.
+    response, body = request(port, "cleanrl.localhost", path="/plus-length")
+    assert body == b"abc" and response.getheader("Content-Length") in (None, "3")
+    # A malformed redirect from a remote is passed on, not a crash.
+    response, _ = request(port, "gpu-runs.gpu.localhost", path="/bad-redirect")
+    assert response.status == 302 and response.getheader("Location") == "http://[x/ok"
 
 
 def test_remote_board_traffic_is_presence_over_there_but_not_a_window(boards):

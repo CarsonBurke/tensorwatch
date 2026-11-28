@@ -10,6 +10,7 @@ import socket
 import sys
 import tempfile
 import time
+import types
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -337,18 +338,54 @@ def test_a_watched_remote_is_kept_up_but_not_treated_as_a_window(machine, link_f
     assert remote_sup.watchers == 0
 
 
-def test_clock_skew_is_corrected(machine, link_for, monkeypatch):
+def test_clock_skew_is_measured_once_and_corrected(machine, link_for, monkeypatch):
     real = time.time
+    # This machine's clock is an hour ahead of the remote's (the same process here).
+    monkeypatch.setattr(remote, "time", types.SimpleNamespace(
+        time=lambda: real() + 3600, monotonic=time.monotonic, sleep=time.sleep))
     link, _ = link_for()
     wait_until(connected(link))
-    board = {"name": "b", "since": 1000.0, "last_event": 2000.0}
+    assert link._offset == pytest.approx(3600, abs=1)
+    board = {"name": "b", "host": "b", "since": 1000.0, "last_event": 2000.0}
     job = {"id": 1, "since": 500.0, "queued_at": 400.0}
-    monkeypatch.setattr(remote.time, "time", lambda: real() + 3600)
-    link._absorb({"now": real(), "boards": [board], "queue": {"running": [job], "queued": []}},
-                 publish=False)
+    link._absorb({"now": real() + 7, "boards": [board],
+                  "queue": {"running": [job], "queued": [], "updated_at": 100.0}}, publish=False)
     shifted = link.to_json()
+    # The frame's own "now" (delivery delay) does not move it.
     assert shifted["boards"][0]["since"] == pytest.approx(4600.0, abs=1)
     assert shifted["queue"]["running"][0]["queued_at"] == pytest.approx(4000.0, abs=1)
+    assert shifted["queue"]["updated_at"] == pytest.approx(3700.0, abs=1)
+
+
+def test_unchanged_frames_are_not_passed_on(machine, link_for):
+    """Two machines that list each other must not echo frames back and forth."""
+    link, window = link_for()
+    wait_until(connected(link))
+    before = window.published
+    for _ in range(5):
+        machine.supervisor.publish()  # same boards, new "now"
+    time.sleep(0.5)
+    assert window.published == before
+
+
+def test_only_dns_labels_from_a_remote_become_host_names(machine, link_for):
+    link, _ = link_for()
+    wait_until(connected(link))
+    link._absorb({"now": time.time(), "boards": [
+        {"name": "ok", "host": "ok"}, {"name": "evil", "host": "evil.example/"}, {"name": "none"},
+    ]}, publish=False)
+    assert [board["name"] for board in link.to_json()["boards"]] == ["ok"]
+
+
+def test_a_ping_leaves_pooled_connections_with_the_relay_timeout(machine, link_for):
+    from tensorwatch import proxy
+
+    link, _ = link_for()
+    wait_until(connected(link))
+    remote.request(link.upstream, "GET", "/healthz", timeout=0.3)
+    conn, reused = link.upstream.acquire()
+    assert reused and conn.sock.gettimeout() == proxy.READ_TIMEOUT
+    link.upstream.release(conn)
 
 
 # -------------------------------------------------------------- failure modes
@@ -589,8 +626,7 @@ def test_remote_add_checks_the_connection(offline, machine, monkeypatch, capsys)
 
 
 def test_remote_hello_prints_only_json(offline, monkeypatch, capsys):
-    def ensure(cfg, timeout=None, peer=False):
-        assert peer, "the hello's own request is a peer's, not a window's"
+    def ensure(cfg, timeout=None):
         print("starting TensorWatch...")  # must not reach stdout
         return True
 
@@ -601,6 +637,39 @@ def test_remote_hello_prints_only_json(offline, monkeypatch, capsys):
     assert hello["app"] == "tensorwatch" and hello["api"] == API_VERSION and hello["running"]
     assert hello["host"] == "127.0.0.1" and "starting" in captured.err
     assert remote.classify_hello(0, captured.out, captured.err) == hello
+
+
+def test_cli_calls_keep_the_manager_up_but_are_not_windows(monkeypatch, home):
+    """A status bar polling `tensorwatch status` must not hold SSH links open."""
+    seen = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def urlopen(request, timeout):
+        seen.update(request.header_items())
+        return Response()
+
+    monkeypatch.setattr(cli.urllib.request, "urlopen", urlopen)
+    cli._api(config.load(), "/api/state")
+    assert seen.get(httpd.PEER_HEADER.capitalize()) == "1"
+
+
+def test_a_new_manager_has_had_no_window(tmp_path):
+    """Started by another machine's hello, it must not connect to its own remotes."""
+    supervisor = Supervisor(Config(server=ServerSpec(port=0), boards=(), path=tmp_path / "c.toml"))
+    assert supervisor.window_idle_for() == float("inf")
+    supervisor.touch(peer=True)
+    assert supervisor.idle_for() < 1 and supervisor.window_idle_for() == float("inf")
+    supervisor.touch()
+    assert supervisor.window_idle_for() < 1
 
 
 def test_open_names_a_remote_board(offline, monkeypatch):

@@ -194,8 +194,10 @@ class Supervisor:
         #: When the manager last had a reason to stay up: a dashboard dropping
         #: its stream, or any control request (a CLI call counts as a visitor).
         self._last_seen = time.monotonic()
-        #: The same, counting only windows on this machine, not peers.
-        self._last_window = self._last_seen
+        #: The same, counting only windows on this machine, not peers or the
+        #: CLI. A manager starts with none: if another machine's ``remote hello``
+        #: started it, connecting to its own remotes would be wrong.
+        self._last_window = float("-inf")
         self._pending_config: Config | None = None
         self._snapshot: tuple[BoardStatus, ...] = ()
         self._activity: Mapping[str, Any] = {}

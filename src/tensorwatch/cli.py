@@ -45,14 +45,16 @@ def _fail(message: str) -> int:
     return 1
 
 
-def _api(
-    cfg: Config, path: str, method: str = "GET", timeout: float = 5.0, peer: bool = False
-) -> Any:
-    """Call the running manager. A ``peer`` call is another machine's TensorWatch
-    asking: it keeps this manager up without counting as a window here."""
+def _api(cfg: Config, path: str, method: str = "GET", timeout: float = 5.0) -> Any:
+    """Call the running manager.
+
+    A call keeps the manager up, but is not a window: a CLI call (or another
+    machine asking through ``remote hello``) must not open SSH links to every
+    remote, as a window does. A status bar polling ``tensorwatch status``
+    would otherwise keep them open forever.
+    """
     url = cfg.dashboard_url.rstrip("/") + path
-    headers = {httpd.PEER_HEADER: "1"} if peer else {}
-    request = urllib.request.Request(url, method=method, headers=headers)
+    request = urllib.request.Request(url, method=method, headers={httpd.PEER_HEADER: "1"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read().decode()
     return json.loads(body) if body else None
@@ -76,11 +78,11 @@ def _socket_owns_port() -> bool:
     )
 
 
-def _healthy(cfg: Config, timeout: float = 2.0, peer: bool = False) -> bool:
+def _healthy(cfg: Config, timeout: float = 2.0) -> bool:
     """A real request, not a bare connect: systemd's socket accepts connections
     while no manager is running, and a request also postpones an idle exit."""
     try:
-        return bool(_api(cfg, "/healthz", timeout=timeout, peer=peer).get("ok"))
+        return bool(_api(cfg, "/healthz", timeout=timeout).get("ok"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError, AttributeError):
         return False
 
@@ -300,29 +302,31 @@ def cmd_serve(args: argparse.Namespace) -> int:
         opened = open_window(cfg.dashboard_url)
         print(f"opened dashboard window via {opened}")
 
-    while not stop.is_set():
-        if reload_requested.is_set():
-            reload_requested.clear()
-            try:
-                ops.reload()
-                print("registry reloaded")
-            except ConfigError as exc:
-                print(f"tensorwatch: reload failed: {exc}", file=sys.stderr)
-        if args.exit_when_idle:
-            idle = supervisor.idle_for()
-            if idle >= current["cfg"].server.idle_exit:
-                print(f"no TensorWatch window for {idle:.0f}s; stopping")
-                break
-        stop.wait(1.0)
-
-    print("tensorwatch shutting down")
-    federation.shutdown()
-    server.shutdown()
-    server.server_close()
-    if subscriber is not None:
-        subscriber.shutdown()
-    watcher.shutdown()
-    supervisor.shutdown()
+    try:
+        while not stop.is_set():
+            if reload_requested.is_set():
+                reload_requested.clear()
+                try:
+                    ops.reload()
+                    print("registry reloaded")
+                except (ConfigError, registry.RegistryError, OSError) as exc:
+                    print(f"tensorwatch: reload failed: {exc}", file=sys.stderr)
+            if args.exit_when_idle:
+                idle = supervisor.idle_for()
+                if idle >= current["cfg"].server.idle_exit:
+                    print(f"no TensorWatch window for {idle:.0f}s; stopping")
+                    break
+            stop.wait(1.0)
+    finally:
+        # Whatever ended the loop, SSH connections and boards must not outlive it.
+        print("tensorwatch shutting down")
+        federation.shutdown()
+        server.shutdown()
+        server.server_close()
+        if subscriber is not None:
+            subscriber.shutdown()
+        watcher.shutdown()
+        supervisor.shutdown()
     return 0
 
 
@@ -848,7 +852,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
             return 0
 
 
-def _ensure_running(cfg: Config, timeout: float = 40.0, peer: bool = False) -> bool:
+def _ensure_running(cfg: Config, timeout: float = 40.0) -> bool:
     """Make sure a manager answers on the dashboard port, starting one if needed.
 
     The desktop launcher goes through here. Under the socket unit the first
@@ -863,7 +867,7 @@ def _ensure_running(cfg: Config, timeout: float = 40.0, peer: bool = False) -> b
         child = _spawn_manager()
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if _healthy(cfg, peer=peer):
+        if _healthy(cfg):
             return True
         if child is not None and child.poll() is not None:
             print(f"TensorWatch exited with code {child.returncode}; see "
@@ -1125,12 +1129,19 @@ def cmd_remote_add(args: argparse.Namespace) -> int:
 
 def cmd_remote_rm(args: argparse.Namespace) -> int:
     path = config_path()
+    failed = removed = 0
+    cfg = None
     for name in args.name:
-        cfg = _apply(path, lambda text, name=name: registry.remove(text, name, table="remote"))
+        try:
+            cfg = _apply(path, lambda text, name=name: registry.remove(text, name, table="remote"))
+        except (registry.RegistryError, ConfigError) as exc:
+            failed += _fail(str(exc))
+            continue
+        removed += 1
         print(f"removed remote {name}")
-    if _notify_reload(cfg):
+    if removed and _notify_reload(cfg):
         print("running manager reloaded")
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_remote_set(args: argparse.Namespace) -> int:
@@ -1236,7 +1247,7 @@ def cmd_remote_hello(args: argparse.Namespace) -> int:
     """
     cfg = load()
     with _stdout_to_stderr():
-        running = _ensure_running(cfg, peer=True)
+        running = _ensure_running(cfg)
     host = cfg.server.host
     if host in ("0.0.0.0", "localhost", ""):
         host = "127.0.0.1"

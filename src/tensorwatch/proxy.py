@@ -56,6 +56,10 @@ BROWSER_CONTEXT = frozenset({
 #: Request bodies are read in full before relaying, which keeps a retry on a
 #: fresh connection possible. TensorBoard's POSTs are a few kilobytes.
 MAX_REQUEST_BODY = 64 * 1024 * 1024
+#: Methods a stale keep-alive connection may be retried with: a request that
+#: may already have reached the upstream must not be applied twice.
+IDEMPOTENT = frozenset({"GET", "HEAD", "OPTIONS"})
+_LENGTH_RE = re.compile(r"[0-9]{1,18}")
 #: Bytes relayed per write; large enough that a multi-megabyte scalar or image
 #: response costs a handful of system calls, small enough to stream promptly.
 CHUNK = 256 * 1024
@@ -107,7 +111,7 @@ def split_host(raw: str | None) -> tuple[str, int | None] | None:
         elif ":" in name:
             return None  # a bare IPv6 address must be bracketed
     if port_text:
-        if not port_text.isdigit() or not 0 < int(port_text) < 65536:
+        if not (port_text.isascii() and port_text.isdigit()) or not 0 < int(port_text) < 65536:
             return None
         port: int | None = int(port_text)
     elif raw.endswith(":"):
@@ -312,20 +316,38 @@ def forward_headers(
     return kept + list(set_.items())
 
 
-def read_body(handler: BaseHTTPRequestHandler) -> bytes | None:
-    """The request body, or None after answering a request that cannot be relayed."""
+def content_length(value: str | None) -> int | None:
+    """A Content-Length value, strictly: digits only (``int`` also takes ``+3``, ``5_0``)."""
+    if value is None:
+        return None
+    value = value.strip()
+    return int(value) if _LENGTH_RE.fullmatch(value) else None
+
+
+def has_body(handler: BaseHTTPRequestHandler) -> bool:
+    """Whether the request carries a body (or claims one, however malformed)."""
+    headers = handler.headers
+    return bool(headers.get("Transfer-Encoding")) or (headers.get("Content-Length") or "0").strip() != "0"
+
+
+def read_body(handler: BaseHTTPRequestHandler, limit: int = MAX_REQUEST_BODY) -> bytes | None:
+    """The request body, or None after answering a request that cannot be relayed.
+
+    Every path that answers without reading the body must close the connection,
+    or the unread bytes are parsed as the next request on it.
+    """
     if handler.headers.get("Transfer-Encoding"):
         # Browsers send lengths; a chunked upload would need streaming support.
         handler.close_connection = True
         send_text(handler, HTTPStatus.LENGTH_REQUIRED, "a Content-Length is required")
         return None
-    try:
-        length = int(handler.headers.get("Content-Length") or 0)
-    except ValueError:
+    raw = handler.headers.get("Content-Length")
+    length = 0 if raw is None else content_length(raw)
+    if length is None:
         handler.close_connection = True
         send_text(handler, HTTPStatus.BAD_REQUEST, "invalid Content-Length")
         return None
-    if length < 0 or length > MAX_REQUEST_BODY:
+    if length > limit:
         handler.close_connection = True
         send_text(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request body too large")
         return None
@@ -376,17 +398,25 @@ def _send(
             if body or method in ("POST", "PUT", "PATCH"):
                 conn.putheader("Content-Length", str(len(body)))
             conn.endheaders(body or None)
-            return conn, conn.getresponse()
+            response = conn.getresponse()
         except (ConnectionResetError, BrokenPipeError, http.client.RemoteDisconnected) as exc:
             conn.close()
-            # A keep-alive connection the far side closed while it sat idle;
-            # nothing reached the upstream's application, so try a new one.
-            if reused and attempt == 1:
+            # Most likely a keep-alive connection the far side closed while it
+            # sat idle, so try a new one; but only if a second copy of the
+            # request could do no harm, since it may have arrived after all.
+            if reused and attempt == 1 and method in IDEMPOTENT:
                 continue
             raise UpstreamError(str(exc) or type(exc).__name__) from exc
         except (OSError, http.client.HTTPException) as exc:
             conn.close()
             raise UpstreamError(str(exc) or type(exc).__name__) from exc
+        if 100 <= response.status < 200:
+            # http.client skips 100 Continue itself. Another interim response
+            # (103 Early Hints) would be relayed as if final, with the real one
+            # left unread on the connection; neither board nor peer sends one.
+            conn.close()
+            raise UpstreamError(f"unexpected interim response {response.status}")
+        return conn, response
     raise AssertionError("unreachable")
 
 
@@ -429,10 +459,10 @@ def _stream(
     """Write the response to the client; True if the upstream connection is reusable."""
     upstream_headers = response.getheaders()
     skip = HOP_BY_HOP | _connection_tokens(upstream_headers) | {"content-length"}
-    no_body = (
-        handler.command == "HEAD" or 100 <= response.status < 200 or response.status in (204, 304)
-    )
-    length = response.getheader("Content-Length")
+    no_body = handler.command == "HEAD" or response.status in (204, 304)
+    # Re-serialised, so a lenient parse upstream cannot reach the browser as is.
+    length_value = content_length(response.getheader("Content-Length"))
+    length = None if length_value is None else str(length_value)
 
     handler.send_response_only(response.status, response.reason)
     for key, value in upstream_headers:
