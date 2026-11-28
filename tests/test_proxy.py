@@ -542,6 +542,10 @@ def test_a_remote_board_is_relayed_through_its_link(boards):
         "Referer": f"http://gpu-runs.gpu.localhost:{port}/", "Cookie": "kept=1",
     })
     assert (response.status, body) == (200, b"ok")
+    # One framing policy, for the browser's dashboard: the remote adds none of
+    # its own, which would name a port the browser never used and block it.
+    policies = [v for k, v in response.getheaders() if k.lower() == "content-security-policy"]
+    assert policies == [f"frame-ancestors 'self' http://localhost:{port} http://127.0.0.1:{port}"]
     seen = boards["gpu"].seen[-1]["headers"]
     # Over there it is that machine's own board origin, asked by a peer.
     assert seen["Host"] == "gpu-runs.localhost"

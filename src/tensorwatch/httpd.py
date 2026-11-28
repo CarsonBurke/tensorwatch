@@ -497,10 +497,15 @@ class ControlHandler(BaseHTTPRequestHandler):
             )
             rewrite = _location_rewriter(inner, raw_host)
             where = f"{link.spec.title} did not answer"
+        # The manager the browser talks to says who may frame the board. One
+        # relaying for a peer leaves that to the peer: it knows the browser's
+        # port, and browsers enforce every policy, so a second would block it.
+        # A navigation cannot carry the peer header, so no page can drop it.
         host = proxy.split_host(raw_host)
+        append = () if self._peer else (board_framing(host and host[1]),)
         try:
             proxy.relay(self, upstream, path=self.path, headers=headers, body=body,
-                        rewrite_location=rewrite, append=(board_framing(host and host[1]),))
+                        rewrite_location=rewrite, append=append)
         except proxy.UpstreamError as exc:
             return self._board_error(HTTPStatus.BAD_GATEWAY, f"{where} ({exc}).")
 
