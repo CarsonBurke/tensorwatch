@@ -9,6 +9,7 @@ import resource
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -19,12 +20,14 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from . import activity, desktop, discover, httpd, queue, registry, service
+from . import __version__, activity, desktop, discover, httpd, queue, registry, remote, service
 from .config import (
     AUTOSTART_MODES,
+    DEFAULT_REMOTE_COMMAND,
     Config,
     ConfigError,
     NAME_RE,
+    REMOTE_NAME_RE,
     config_path,
     load,
     log_dir,
@@ -32,7 +35,7 @@ from .config import (
     parse,
     state_dir,
 )
-from .supervisor import LOG_ROTATE_BYTES, Supervisor, probe, raise_file_limit
+from .supervisor import API_VERSION, LOG_ROTATE_BYTES, Supervisor, probe, raise_file_limit
 
 # --------------------------------------------------------------------- helpers
 
@@ -42,9 +45,14 @@ def _fail(message: str) -> int:
     return 1
 
 
-def _api(cfg: Config, path: str, method: str = "GET", timeout: float = 5.0) -> Any:
+def _api(
+    cfg: Config, path: str, method: str = "GET", timeout: float = 5.0, peer: bool = False
+) -> Any:
+    """Call the running manager. A ``peer`` call is another machine's TensorWatch
+    asking: it keeps this manager up without counting as a window here."""
     url = cfg.dashboard_url.rstrip("/") + path
-    request = urllib.request.Request(url, method=method)
+    headers = {httpd.PEER_HEADER: "1"} if peer else {}
+    request = urllib.request.Request(url, method=method, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read().decode()
     return json.loads(body) if body else None
@@ -68,11 +76,11 @@ def _socket_owns_port() -> bool:
     )
 
 
-def _healthy(cfg: Config, timeout: float = 2.0) -> bool:
+def _healthy(cfg: Config, timeout: float = 2.0, peer: bool = False) -> bool:
     """A real request, not a bare connect: systemd's socket accepts connections
     while no manager is running, and a request also postpones an idle exit."""
     try:
-        return bool(_api(cfg, "/healthz", timeout=timeout).get("ok"))
+        return bool(_api(cfg, "/healthz", timeout=timeout, peer=peer).get("ok"))
     except (urllib.error.URLError, OSError, json.JSONDecodeError, AttributeError):
         return False
 
@@ -214,6 +222,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         current["cfg"] = fresh
         ops.forget_suggestions()
         supervisor.reload(fresh)
+        federation.update(fresh.remotes)
         if subscriber is not None:
             # Re-match the queue against the new registry instead of waiting for
             # mlqd's next push, which for a long run can be hours away.
@@ -245,6 +254,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
     ops = RegistryOps(path, do_reload, lambda: current["cfg"])
 
+    # Remotes connect while a window here is open, and stay connected for the
+    # same idle_exit grace the manager itself gets; a peer showing this
+    # machine's boards elsewhere does not count, or two machines that list each
+    # other would hold each other's links open forever.
+    federation = remote.Federation(
+        cfg.remotes,
+        supervisor.publish,
+        lambda: supervisor.window_idle_for() < current["cfg"].server.idle_exit,
+    )
+    supervisor.set_remote_source(federation.snapshot)
+
     server = httpd.serve(
         supervisor,
         cfg.server.host,
@@ -258,6 +278,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         discover.complete,
         ops.suggest,
         inherited,
+        federation,
     )
     supervisor.start()
 
@@ -272,7 +293,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if args.exit_when_idle:
         print(f"  exits {cfg.server.idle_exit:.0f}s after the last window closes")
     for spec in cfg.boards:
-        print(f"  {spec.name:<20} {spec.url:<24} {spec.target}")
+        print(f"  {spec.name:<20} {cfg.board_url(spec.name):<36} {spec.target}")
+    for spec in cfg.remotes:
+        print(f"  remote {spec.name:<13} ssh {spec.ssh}{'' if spec.enabled else ' (disabled)'}")
     if args.window:
         opened = open_window(cfg.dashboard_url)
         print(f"opened dashboard window via {opened}")
@@ -293,6 +316,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         stop.wait(1.0)
 
     print("tensorwatch shutting down")
+    federation.shutdown()
     server.shutdown()
     server.server_close()
     if subscriber is not None:
@@ -727,6 +751,8 @@ def cmd_list(args: argparse.Namespace) -> int:
     cfg = load()
     if not cfg.boards:
         print(f"no boards registered in {cfg.path}; try `tensorwatch scan <dir> --add`")
+        if cfg.remotes:
+            print(f"{len(cfg.remotes)} remote(s); `tensorwatch remote list` shows them")
         return 0
     live = _live_state(cfg)
     states = {b["name"]: b for b in (live or {}).get("boards", [])}
@@ -743,6 +769,8 @@ def cmd_list(args: argparse.Namespace) -> int:
             spec.target,
         ])
     print(_table(rows, ["board", "state", "port", "policy", "rss", "cpu", "logdir"]))
+    if cfg.remotes:
+        print(f"\nand {len(cfg.remotes)} remote(s); `tensorwatch remote list` shows them")
     if live is None:
         print(f"\nTensorWatch is not running; `tensorwatch open` starts it ({cfg.dashboard_url})")
     else:
@@ -755,7 +783,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     live = _live_state(cfg)
     if live is None:
         return _fail(f"TensorWatch is not running; `tensorwatch open` starts it ({cfg.dashboard_url})")
-    boards = live["boards"]
+    boards = list(live["boards"])
+    for link in live.get("remotes") or ():
+        boards += [{**board, "name": f"{board['name']}@{link['name']}"} for board in link["boards"]]
     if args.name:
         boards = [b for b in boards if b["name"] == args.name]
         if not boards:
@@ -766,6 +796,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     for board in boards:
         age = f" up {int(time.time() - board['since'])}s" if board.get("since") else ""
         print(f"{board['name']:<20} {board['state']:<9} :{board['port']}{age}  {board['message']}")
+    if not args.name:
+        for link in live.get("remotes") or ():
+            print(f"remote {link['name']}: {remote.summarize(link)}")
     return 0
 
 
@@ -815,7 +848,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
             return 0
 
 
-def _ensure_running(cfg: Config, timeout: float = 40.0) -> bool:
+def _ensure_running(cfg: Config, timeout: float = 40.0, peer: bool = False) -> bool:
     """Make sure a manager answers on the dashboard port, starting one if needed.
 
     The desktop launcher goes through here. Under the socket unit the first
@@ -830,7 +863,7 @@ def _ensure_running(cfg: Config, timeout: float = 40.0) -> bool:
         child = _spawn_manager()
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if _healthy(cfg):
+        if _healthy(cfg, peer=peer):
             return True
         if child is not None and child.poll() is not None:
             print(f"TensorWatch exited with code {child.returncode}; see "
@@ -872,20 +905,28 @@ def _package_pythonpath() -> str:
     return root if not current else f"{root}{os.pathsep}{current}"
 
 
-def board_page_url(cfg: Config, name: str) -> str:
+def board_page_url(cfg: Config, name: str, remote_name: str | None = None) -> str:
     """A board in its own window, served by the dashboard so the window counts as open."""
     from urllib.parse import quote
 
-    return f"{cfg.dashboard_url}boards/{quote(name, safe='')}"
+    key = f"{name}@{remote_name}" if remote_name else name
+    return f"{cfg.dashboard_url}boards/{quote(key, safe='@')}"
 
 
 def cmd_open(args: argparse.Namespace) -> int:
     cfg = load()
     url = cfg.dashboard_url
     if args.name:
-        if cfg.board(args.name) is None:
-            return _fail(f"no board {args.name!r}")
-        url = board_page_url(cfg, args.name)
+        # NAME@REMOTE is a board on a remote machine; @ never occurs in a board name.
+        name, _, where = args.name.rpartition("@") if "@" in args.name else (args.name, "", "")
+        if where:
+            if cfg.remote(where) is None:
+                return _fail(f"no remote {where!r}; `tensorwatch remote list` shows them")
+            if not name:
+                return _fail("expected BOARD@REMOTE")
+        elif cfg.board(name) is None:
+            return _fail(f"no board {name!r}")
+        url = board_page_url(cfg, name, where or None)
     if not args.no_start:
         # Open the window even if the start failed: the dashboard shows that
         # it is offline and reconnects by itself.
@@ -1050,6 +1091,179 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------- remotes
+
+
+def _remote_spec(cfg: Config, name: str):
+    spec = cfg.remote(name)
+    if spec is None:
+        known = ", ".join(r.name for r in cfg.remotes) or "none yet"
+        raise ConfigError(f"no remote {name!r} in {cfg.path} ({known})")
+    return spec
+
+
+def cmd_remote_add(args: argparse.Namespace) -> int:
+    if not REMOTE_NAME_RE.match(args.name):
+        return _fail(
+            f"remote name {args.name!r} must be lowercase letters, digits and '-', at most "
+            "32 characters; it becomes part of the boards' addresses"
+        )
+    entry: dict[str, Any] = {"name": args.name, "ssh": args.ssh}
+    if args.label:
+        entry["label"] = args.label
+    if args.command and args.command != DEFAULT_REMOTE_COMMAND:
+        entry["command"] = args.command
+    path = config_path()
+    cfg = _apply(path, lambda text: registry.add(text, entry, table="remote"))
+    print(f"registered remote {args.name} (ssh {args.ssh}) in {path}")
+    if _notify_reload(cfg):
+        print("running manager reloaded")
+    if args.no_check:
+        return 0
+    return _report_check(_remote_spec(cfg, args.name), registered=True)
+
+
+def cmd_remote_rm(args: argparse.Namespace) -> int:
+    path = config_path()
+    for name in args.name:
+        cfg = _apply(path, lambda text, name=name: registry.remove(text, name, table="remote"))
+        print(f"removed remote {name}")
+    if _notify_reload(cfg):
+        print("running manager reloaded")
+    return 0
+
+
+def cmd_remote_set(args: argparse.Namespace) -> int:
+    path = config_path()
+    cfg = load(path)
+    _remote_spec(cfg, args.name)
+
+    def mutate(text: str) -> str:
+        if args.ssh:
+            text = registry.set_key(text, args.name, "ssh", args.ssh, table="remote")
+        if args.label is not None:
+            text = (registry.set_key(text, args.name, "label", args.label, table="remote")
+                    if args.label else registry.unset_key(text, args.name, "label", table="remote"))
+        if args.command is not None:
+            text = (registry.unset_key(text, args.name, "command", table="remote")
+                    if args.command in ("", DEFAULT_REMOTE_COMMAND)
+                    else registry.set_key(text, args.name, "command", args.command, table="remote"))
+        if args.enabled is not None:
+            text = (registry.unset_key(text, args.name, "enabled", table="remote") if args.enabled
+                    else registry.set_key(text, args.name, "enabled", False, table="remote"))
+        return text
+
+    cfg = _apply(path, mutate)
+    print(f"updated remote {args.name}")
+    if _notify_reload(cfg):
+        print("running manager reloaded")
+    return 0
+
+
+def cmd_remote_list(args: argparse.Namespace) -> int:
+    cfg = load()
+    if not cfg.remotes:
+        print("no remotes; add one with `tensorwatch remote add NAME --ssh HOST`")
+        return 0
+    live = _live_state(cfg)
+    states = {link["name"]: link for link in (live or {}).get("remotes") or ()}
+    if args.json:
+        print(json.dumps([
+            {"name": spec.name, "ssh": spec.ssh, "label": spec.title, "command": spec.command,
+             "enabled": spec.enabled, "live": states.get(spec.name)}
+            for spec in cfg.remotes
+        ], indent=2))
+        return 0
+    rows = []
+    for spec in cfg.remotes:
+        link = states.get(spec.name)
+        if not spec.enabled:
+            state = "disabled"
+        elif live is None:
+            state = "TensorWatch not running"
+        else:
+            state = remote.summarize(link) if link else "?"
+        rows.append([spec.name, spec.title, spec.ssh, state])
+    print(_table(rows, ["remote", "label", "ssh", "state"]))
+    return 0
+
+
+def _report_check(spec, registered: bool = False) -> int:
+    print(f"connecting to {spec.title} (ssh {spec.ssh})...", flush=True)
+    result = remote.check(spec)
+    print(f"  {remote.summarize(result)}")
+    if result.get("state") == "connected":
+        for board in result.get("boards") or ():
+            print(f"    {board['name']:<20} {board['state']}")
+        return 0
+    hint = _remote_hint(spec, (result.get("error") or {}).get("kind"))
+    if hint:
+        print(f"  {hint}")
+    if registered:
+        print(f"  the remote stays registered; `tensorwatch remote check {spec.name}` tries again")
+    return 1
+
+
+def _remote_hint(spec, kind: str | None) -> str:
+    return {
+        remote.AUTH: f"`ssh {spec.ssh}` must log in without a password prompt (a key or agent)",
+        remote.HOST_KEY: f"run `ssh {spec.ssh}` once to accept its host key",
+        remote.UNREACHABLE: f"check that `ssh {spec.ssh} true` works from here",
+        remote.MISSING: (
+            "install TensorWatch there (`tensorwatch install`), or point at it with "
+            f"`tensorwatch remote set {spec.name} --command /path/to/tensorwatch`"),
+        remote.TOO_OLD: "update TensorWatch there, then `systemctl --user restart tensorwatch`",
+    }.get(kind or "", "")
+
+
+def cmd_remote_check(args: argparse.Namespace) -> int:
+    cfg = load()
+    specs = [_remote_spec(cfg, name) for name in args.name] if args.name else list(cfg.remotes)
+    if not specs:
+        print("no remotes; add one with `tensorwatch remote add NAME --ssh HOST`")
+        return 0
+    status = 0
+    for spec in specs:
+        status |= _report_check(spec)
+    return status
+
+
+def cmd_remote_hello(args: argparse.Namespace) -> int:
+    """Answer another machine's TensorWatch over SSH: start, then say where.
+
+    Prints one JSON line; stdout carries nothing else, so a login banner on
+    stderr cannot confuse the caller.
+    """
+    cfg = load()
+    with _stdout_to_stderr():
+        running = _ensure_running(cfg, peer=True)
+    host = cfg.server.host
+    if host in ("0.0.0.0", "localhost", ""):
+        host = "127.0.0.1"
+    elif host == "::":
+        host = "::1"
+    print(json.dumps({
+        "app": "tensorwatch",
+        "version": __version__,
+        "api": API_VERSION,
+        "host": host,
+        "port": cfg.server.port,
+        "hostname": socket.gethostname(),
+        "running": running,
+        "error": None if running else "TensorWatch did not start; see `tensorwatch doctor` there",
+    }), flush=True)
+    return 0 if running else 1
+
+
+class _stdout_to_stderr:
+    def __enter__(self) -> None:
+        self._saved = sys.stdout
+        sys.stdout = sys.stderr
+
+    def __exit__(self, *exc: object) -> None:
+        sys.stdout = self._saved
+
+
 # ---------------------------------------------------------------------- parser
 
 
@@ -1157,11 +1371,45 @@ def build_parser() -> argparse.ArgumentParser:
     p_logs.set_defaults(func=cmd_logs)
 
     p_open = sub.add_parser("open", help="open the dashboard (or one board) in a window")
-    p_open.add_argument("name", nargs="?")
+    p_open.add_argument("name", nargs="?", help="a board, or BOARD@REMOTE")
     p_open.add_argument("--tab", action="store_true", help="normal browser tab instead of app window")
     p_open.add_argument("--no-start", action="store_true",
                         help="do not start TensorWatch when it is not running")
     p_open.set_defaults(func=cmd_open)
+
+    p_remote = sub.add_parser(
+        "remote", help="show another machine's boards and queue here, over SSH")
+    remote_sub = p_remote.add_subparsers(dest="remote_command", required=True)
+    r_add = remote_sub.add_parser("add", help="register a machine reachable with ssh")
+    r_add.add_argument("name", help="short name; boards appear at BOARD.NAME.localhost")
+    r_add.add_argument("--ssh", required=True, metavar="DEST",
+                       help="what you would pass to ssh: an alias from ~/.ssh/config or user@host")
+    r_add.add_argument("--label", help="display name in the dashboard (default: the name)")
+    r_add.add_argument("--command", default=DEFAULT_REMOTE_COMMAND,
+                       help="tensorwatch on the remote, as a shell command (default: tensorwatch)")
+    r_add.add_argument("--no-check", action="store_true", help="do not try connecting now")
+    r_add.set_defaults(func=cmd_remote_add)
+    r_rm = remote_sub.add_parser("rm", help="unregister a remote")
+    r_rm.add_argument("name", nargs="+")
+    r_rm.set_defaults(func=cmd_remote_rm)
+    r_set = remote_sub.add_parser("set", help="change a remote")
+    r_set.add_argument("name")
+    r_set.add_argument("--ssh", metavar="DEST")
+    r_set.add_argument("--label", help="display name; empty to use the name")
+    r_set.add_argument("--command", help="tensorwatch on the remote; empty for the default")
+    toggle = r_set.add_mutually_exclusive_group()
+    toggle.add_argument("--enable", dest="enabled", action="store_const", const=True)
+    toggle.add_argument("--disable", dest="enabled", action="store_const", const=False)
+    r_set.set_defaults(func=cmd_remote_set, enabled=None)
+    r_list = remote_sub.add_parser("list", help="list remotes and their connection state")
+    r_list.add_argument("--json", action="store_true")
+    r_list.set_defaults(func=cmd_remote_list)
+    r_check = remote_sub.add_parser("check", help="connect to remotes once and report")
+    r_check.add_argument("name", nargs="*")
+    r_check.set_defaults(func=cmd_remote_check)
+    # What a remote's TensorWatch runs here over SSH; not for people.
+    r_hello = remote_sub.add_parser("hello")
+    r_hello.set_defaults(func=cmd_remote_hello)
 
     p_queue = sub.add_parser("queue", help="show the mlq queue as tensorwatch sees it")
     p_queue.add_argument("--json", action="store_true")

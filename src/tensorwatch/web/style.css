@@ -224,7 +224,26 @@ button.sect:hover { color: var(--fg); }
 .b-r2 svg.icon { width: 13px; height: 13px; }
 .board.state-failed .b-meta { color: var(--bad); }
 .board.state-backoff .b-meta, .board.state-starting .b-meta { color: var(--warn); }
-.board.state-disabled .b-name { color: var(--fg-4); }
+.board.state-disabled .b-name, .board.state-offline .b-name { color: var(--fg-4); }
+
+/* With remotes, the list is grouped by machine. */
+.machine {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+  padding: 10px 10px 4px; font-size: 11.5px; font-weight: 600; color: var(--fg-3);
+}
+.machine:first-child { padding-top: 2px; }
+.m-name { flex: none; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-meta { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 400; color: var(--fg-4); }
+.m-meta.warn { color: var(--warn); }
+.m-meta.bad { color: var(--bad); font-weight: 500; }
+.machine .m-retry { flex: none; width: 22px; height: 22px; margin: -4px -4px -4px 0; }
+.machine .m-retry svg.icon { width: 13px; height: 13px; }
+.rq-machine {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px 2px; font-size: 12px; font-weight: 600; color: var(--fg-2);
+}
+.rq-machine .grow { flex: 1; }
+.rq-machine + .rq-sub { padding-top: 4px; }
 .b-more { position: absolute; right: 6px; top: 6px; width: 26px; height: 26px; visibility: hidden; background: var(--hover); }
 .board:not(.active):hover .b-more, .board:not(.active):focus-within .b-more, .board.menu-open .b-more { visibility: visible; }
 .board:not(.active):hover .b-r1, .board:not(.active):focus-within .b-r1, .board.menu-open .b-r1 { visibility: hidden; }
@@ -254,6 +273,7 @@ button.sect:hover { color: var(--fg); }
 .dot.failed { background: var(--bad); }
 .dot.stopped { background: transparent; box-shadow: inset 0 0 0 1.75px var(--idle); }
 .dot.disabled { background: transparent; box-shadow: inset 0 0 0 1.75px var(--line); }
+.dot.offline { background: transparent; box-shadow: inset 0 0 0 1.75px var(--idle); opacity: 0.6; }
 @keyframes pulse { 50% { opacity: 0.35; } }
 
 .act { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 500; color: var(--ok); white-space: nowrap; }
@@ -293,6 +313,7 @@ button.sect:hover { color: var(--fg); }
 #queue-body { display: flex; flex-direction: column; min-height: 0; padding: 0 8px 8px; }
 #queue-jobs { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 #queue-body > :not(#queue-jobs) { flex: none; }
+#queue-jobs .queue-error { margin-top: 6px; }
 #queue.collapsed #queue-body { display: none; }
 .slots { display: inline-flex; gap: 3px; }
 .slots i { width: 12px; height: 5px; border-radius: 3px; background: var(--line); }
@@ -344,6 +365,7 @@ button.sect:hover { color: var(--fg); }
 .rail-collapsed .brand h1, .rail-collapsed .hide-collapsed, .rail-collapsed .filter, .rail-collapsed .nav-item .label,
 .rail-collapsed .nav-item .count, .rail-collapsed .sect, .rail-collapsed .b-name, .rail-collapsed .b-l2,
 .rail-collapsed .b-r1 > :not(.b-key), .rail-collapsed .b-ext, .rail-collapsed .b-more, .rail-collapsed #queue,
+.rail-collapsed .machine,
 .rail-collapsed .foot, .rail-collapsed .empty { display: none; }
 .rail-collapsed .brand { flex-direction: column; padding: 12px 0; gap: 8px; }
 .rail-collapsed .brand img { margin: 0; }
@@ -434,6 +456,14 @@ table.t { width: 100%; border-collapse: collapse; }
 .t td { padding: 9px 12px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; vertical-align: middle; }
 .t tr:last-child td { border-bottom: 0; }
 .t tbody tr.link { cursor: pointer; }
+.t tbody tr.grp th {
+  position: static; padding: 16px 12px 6px; border-bottom: 1px solid var(--line);
+  text-align: left; font-size: 12.5px; font-weight: 600; color: var(--fg-2); background: none;
+}
+.t tbody tr.grp:first-child th { padding-top: 8px; }
+.t tbody tr.grp th .muted { margin-left: 10px; font-weight: 400; }
+.t tbody tr.grp th .muted.warn { color: var(--warn); }
+.t tbody tr.grp th .muted.bad { color: var(--bad); font-weight: 500; }
 .t tbody tr.link:hover td { background: var(--hover); }
 .t .num { text-align: right; }
 .t td.dim { color: var(--fg-3); }
