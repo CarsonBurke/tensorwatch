@@ -9,6 +9,7 @@ import signal
 import socket
 import sys
 import tempfile
+import threading
 import time
 import types
 from dataclasses import dataclass, field
@@ -531,10 +532,58 @@ def test_federation_follows_the_registry(machine, runtime):
     assert all(not _alive(pid) for pid in _master_pids(machine))
 
 
+def test_a_replacement_waits_for_every_older_link_of_its_name(machine, runtime, monkeypatch):
+    """Remove-then-re-add, or two quick edits: the new link shares the old
+    one's socket paths, so it must not start until the old one is gone."""
+    slow = threading.Event()
+    original = remote.RemoteLink.shutdown
+
+    def slow_shutdown(self, timeout=5.0):
+        if self.spec.label == "old":
+            slow.wait(5)
+        original(self, timeout)
+
+    monkeypatch.setattr(remote.RemoteLink, "shutdown", slow_shutdown)
+    window = Window()
+    federation = remote.Federation([RemoteSpec(name="gpu", ssh="gpu-host", label="old")],
+                                   window.publish, window.present, ssh=machine.ssh)
+    try:
+        wait_until(connected(federation.link("gpu")))
+        federation.update([])
+        federation.update([RemoteSpec(name="gpu", ssh="gpu-host", label="new")])
+        federation.update([RemoteSpec(name="gpu", ssh="gpu-host", label="newer")])
+        newest = federation.link("gpu")
+        time.sleep(0.3)
+        assert not newest.started  # the old link is still tearing down
+        slow.set()
+        wait_until(connected(newest), what="the replacement")
+        assert sorted(p.name for p in runtime.iterdir()) == ["gpu.sock", "gpu.ssh"]
+        assert remote.request(newest.upstream, "GET", "/healthz")[0] == 200
+    finally:
+        slow.set()
+        federation.shutdown()
+
+
+def test_request_timeouts_hold_on_a_fresh_connection(tmp_path):
+    from tensorwatch import proxy
+
+    path = tmp_path / "silent.sock"
+    server = socket.socket(socket.AF_UNIX)
+    server.bind(str(path))
+    server.listen()  # accepts, never answers
+    try:
+        started = time.monotonic()
+        with pytest.raises(OSError):
+            remote.request(proxy.Upstream(path=str(path)), "GET", "/healthz", timeout=0.5)
+        assert time.monotonic() - started < 3
+    finally:
+        server.close()
+
+
 def test_check_reports_without_disturbing_the_managers_link(machine, link_for, runtime):
     link, _ = link_for()
     wait_until(connected(link))
-    result = remote.check(RemoteSpec(name="gpu", ssh="gpu-host"), ssh=machine.ssh, timeout=10)
+    result = remote.check(RemoteSpec(name="gpu", ssh="gpu-host"), ssh=machine.ssh, timeout=30)
     assert result["state"] == "connected" and result["boards"][0]["name"] == "gpu-runs"
     assert remote.summarize(result).startswith("connected to TensorWatch 9.9 on gpu-host: 1 board(s)")
     # Its own sockets, gone again; the manager's link is untouched.

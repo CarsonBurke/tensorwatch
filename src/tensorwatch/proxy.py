@@ -67,7 +67,7 @@ CHUNK = 256 * 1024
 #: TensorWatch keeps connections open; each new one is an SSH channel, which
 #: costs a round trip. TensorBoard closes every connection, so it never pools.
 POOL_SIZE = 8
-POOL_IDLE = 30.0
+POOL_IDLE = 60.0  # longer than a remote link's ping interval, so pings reuse one
 CONNECT_TIMEOUT = 5.0
 #: A response may take this long to start or to send its next byte. TensorBoard
 #: can spend tens of seconds on a first scalar query over thousands of runs.

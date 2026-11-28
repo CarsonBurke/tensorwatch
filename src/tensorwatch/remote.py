@@ -21,7 +21,7 @@ manager relays them to its TensorBoard (see :mod:`tensorwatch.proxy`).
 from __future__ import annotations
 
 import collections
-import itertools
+import functools
 import json
 import os
 import shutil
@@ -203,8 +203,9 @@ def request(
     conn, reused = upstream.acquire()
     try:
         conn.timeout = timeout
-        if conn.sock is not None:
-            conn.sock.settimeout(timeout)
+        if conn.sock is None:
+            conn.connect()  # now, so the timeout below applies to this request too
+        conn.sock.settimeout(timeout)
         conn.request(method, path, headers={"Host": "localhost", PEER_HEADER: "1"})
         response = conn.getresponse()
         body = response.read()
@@ -292,6 +293,10 @@ class RemoteLink:
         self._ping_interval = PING_INTERVAL
 
     # ------------------------------------------------------------ interface
+
+    @property
+    def started(self) -> bool:
+        return self._thread.ident is not None
 
     def start(self) -> None:
         self._thread.start()
@@ -479,10 +484,10 @@ class RemoteLink:
         control.unlink(missing_ok=True)
         self._stderr.clear()
         argv = ssh.master()
-        if _SETPRIV:
+        if _setpriv():
             # Should this manager die without tearing down, the master goes too,
             # instead of holding a connection open with nobody to use it.
-            argv = [_SETPRIV, "--pdeathsig", "TERM", "--", *argv]
+            argv = [_setpriv(), "--pdeathsig", "TERM", "--", *argv]
         try:
             master = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -686,7 +691,17 @@ def _wait_for(
     return path.exists()
 
 
-_SETPRIV = shutil.which("setpriv")
+@functools.cache
+def _setpriv() -> str | None:
+    """util-linux's setpriv, if it has ``--pdeathsig`` (2.33 and later)."""
+    path = shutil.which("setpriv")
+    if path is None:
+        return None
+    try:
+        help_text = subprocess.run([path, "--help"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return path if "--pdeathsig" in help_text else None
 
 
 def default_ssh() -> str:
@@ -746,31 +761,37 @@ class Federation:
                 ordered[name] = link
             self._links = ordered
             self._stopping.extend(stale)
+            # Links with a name still shutting down (from this reload or an
+            # earlier one) wait for it: they share its socket paths.
+            busy = {link.spec.name for link in self._stopping}
+            for link in fresh:
+                if link.spec.name not in busy:
+                    link.start()
         for link in stale:
             link.stop()
-        replacing = {link.spec.name for link in stale}
-        for link in fresh:
-            if link.spec.name not in replacing:
-                link.start()
         if stale:
-            later = [link for link in fresh if link.spec.name in replacing]
             threading.Thread(
-                target=self._replace, args=(stale, later), name="tensorwatch-remote-reload",
-                daemon=True,
+                target=self._reap, args=(stale,), name="tensorwatch-remote-reload", daemon=True,
             ).start()
         if stale or fresh:
             self._publish()
 
-    def _replace(self, stale: list[RemoteLink], fresh: list[RemoteLink]) -> None:
+    def _reap(self, stale: list[RemoteLink]) -> None:
+        """Finish stopping links, then start the links that waited on them."""
         for link in stale:
             link.shutdown()
         with self._lock:
             for link in stale:
                 if link in self._stopping:
                     self._stopping.remove(link)
-            current = [link for link in fresh if self._links.get(link.spec.name) is link]
-        for link in current:
-            link.start()
+            busy = {link.spec.name for link in self._stopping}
+            waiting = [
+                link for name, link in self._links.items()
+                if name not in busy and name in {old.spec.name for old in stale}
+                and not link.started
+            ]
+            for link in waiting:
+                link.start()
 
     def nudge(self) -> None:
         for link in self.links:
@@ -814,6 +835,8 @@ def check(spec: RemoteSpec, ssh: str | None = None, timeout: float = 120.0) -> d
 def summarize(remote: Mapping[str, Any]) -> str:
     """One line about a remote's state, for the CLI."""
     state = remote.get("state")
+    if remote.get("enabled") is False:
+        return "disabled"
     if state == "idle":
         return "not connected (connects while a TensorWatch window is open)"
     if state == "connected":
