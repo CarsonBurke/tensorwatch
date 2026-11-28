@@ -48,6 +48,10 @@ WANTED_NOFILE = 65536
 TERM_GRACE = 10.0
 
 Action = Literal["start", "stop", "restart", "demand", "renew"]
+#: What a peer TensorWatch can rely on in this manager's HTTP API: board
+#: origins through the dashboard port, ``host`` in each board's status, and
+#: peer streams. A peer refuses anything older.
+API_VERSION = 2
 
 
 class State(str, Enum):
@@ -66,7 +70,10 @@ class BoardStatus:
     name: str
     state: str
     port: int
+    #: The board's own port, for tools on this machine. Browsers use the
+    #: board's origin instead: ``http://<host>.localhost:<dashboard port>/``.
     url: str
+    host: str
     target: str
     description: str
     autostart: str
@@ -158,6 +165,8 @@ class Supervisor:
         activity_source: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self._config = config
+        #: Optional callable returning the remotes' state for the dashboard.
+        self._remote_source: Callable[[], Any] | None = None
         #: Optional callable returning per-board logdir activity; this is what makes
         #: a row say "data is arriving", independent of who launched the run.
         self._activity_source = activity_source
@@ -168,6 +177,11 @@ class Supervisor:
         self._order: list[str] = []
         self._requests: queue.Queue[tuple[Action, str]] = queue.Queue()
         self._subscribers: set[queue.Queue[str]] = set()
+        #: Streams held by another TensorWatch that shows this one's boards.
+        #: They follow along but are not windows: a peer whose network vanished
+        #: can keep a stream open for many minutes, so peers keep this manager
+        #: up by asking regularly instead (see :meth:`touch`).
+        self._peers: set[queue.Queue[str]] = set()
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._stopping = threading.Event()
@@ -180,6 +194,10 @@ class Supervisor:
         #: When the manager last had a reason to stay up: a dashboard dropping
         #: its stream, or any control request (a CLI call counts as a visitor).
         self._last_seen = time.monotonic()
+        #: The same, counting only windows on this machine, not peers or the
+        #: CLI. A manager starts with none: if another machine's ``remote hello``
+        #: started it, connecting to its own remotes would be wrong.
+        self._last_window = float("-inf")
         self._pending_config: Config | None = None
         self._snapshot: tuple[BoardStatus, ...] = ()
         self._activity: Mapping[str, Any] = {}
@@ -191,16 +209,27 @@ class Supervisor:
     def set_activity_source(self, source: Callable[[], Mapping[str, Any]] | None) -> None:
         self._activity_source = source
 
+    def set_remote_source(self, source: Callable[[], Any] | None) -> None:
+        self._remote_source = source
+
     @property
     def watchers(self) -> int:
-        """Number of connected dashboards (SSE subscribers)."""
+        """Number of connected dashboards (SSE subscribers that are not peers)."""
         with self._lock:
-            return len(self._subscribers)
+            return len(self._subscribers) - len(self._peers)
 
-    def touch(self) -> None:
-        """Note a control request, so a CLI call does not race the idle exit."""
+    def touch(self, peer: bool = False) -> None:
+        """Note a control request, so a CLI call does not race the idle exit.
+
+        A ``peer`` is another TensorWatch showing this one's boards: it keeps
+        this manager up, but is not a window here. Counting it as one would let
+        two machines that list each other as remotes keep each other up forever.
+        """
+        now = time.monotonic()
         with self._lock:
-            self._last_seen = time.monotonic()
+            self._last_seen = now
+            if not peer:
+                self._last_window = now
 
     def idle_for(self) -> float:
         """Seconds since the last dashboard disconnected or request arrived.
@@ -209,9 +238,20 @@ class Supervisor:
         one, is what keeps the manager and its boards alive.
         """
         with self._lock:
-            if self._subscribers:
+            if len(self._subscribers) > len(self._peers):
                 return 0.0
             return max(0.0, time.monotonic() - self._last_seen)
+
+    def window_idle_for(self) -> float:
+        """Like :meth:`idle_for`, but only windows on this machine count.
+
+        This is what decides whether to connect to remotes: a peer asking for
+        this machine's boards does not make it want another machine's.
+        """
+        with self._lock:
+            if len(self._subscribers) > len(self._peers):
+                return 0.0
+            return max(0.0, time.monotonic() - self._last_window)
 
     def publish(self) -> None:
         """Push a state frame without touching child state.
@@ -283,19 +323,26 @@ class Supervisor:
 
     # ------------------------------------------------------------------- events
 
-    def subscribe(self) -> queue.Queue[str]:
+    def subscribe(self, peer: bool = False) -> queue.Queue[str]:
         channel: queue.Queue[str] = queue.Queue(maxsize=32)
         with self._lock:
             self._subscribers.add(channel)
+            if peer:
+                self._peers.add(channel)
             # Enqueue the first frame while holding the lock: a publish that
             # starts right after the add must not overtake this snapshot.
             channel.put_nowait(self._encode(self._snapshot))
         return channel
 
     def unsubscribe(self, channel: queue.Queue[str]) -> None:
+        now = time.monotonic()
         with self._lock:
             self._subscribers.discard(channel)
-            self._last_seen = time.monotonic()
+            self._last_seen = now
+            if channel in self._peers:
+                self._peers.discard(channel)
+            else:
+                self._last_window = now
 
     # -------------------------------------------------------------- internals
 
@@ -696,6 +743,7 @@ class Supervisor:
             state=runtime.state.value,
             port=spec.port,
             url=spec.url,
+            host=self._config.hosts.get(spec.name, ""),
             target=spec.target,
             description=spec.description,
             autostart=spec.autostart,
@@ -755,23 +803,27 @@ class Supervisor:
         """Fields worth waking the browser for (resource counters are not)."""
         return tuple(
             (s.name, s.state, s.pid, s.message, s.restarts, s.enabled, s.port, s.writing,
-             s.next_attempt)
+             s.next_attempt, s.host)
             for s in statuses
         )
 
     def _encode(self, statuses: tuple[BoardStatus, ...]) -> str:
         server = self._config.server
         snapshot = self._queue_source() if self._queue_source is not None else None
+        remotes = self._remote_source() if self._remote_source is not None else []
         return json.dumps(
             {
+                "api": API_VERSION,
                 "boards": [status.to_json() for status in statuses],
                 "queue": snapshot.to_json() if snapshot is not None else None,
+                "remotes": remotes,
                 "server": {
                     "keep_warm": server.keep_warm,
                     "port": server.port,
                     "config_path": str(self._config.path),
                     "queue_visible": self._config.queue.visible,
                     "idle_exit": server.idle_exit,
+                    "hostname": socket.gethostname(),
                 },
                 "now": time.time(),
             },

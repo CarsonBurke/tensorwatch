@@ -14,9 +14,16 @@ The registry is a hand-editable TOML file (default ``~/.config/tensorwatch/confi
     logdir = "~/Documents/repositories/cleanrl/runs"
     port = 6100
 
+    [[remote]]
+    name = "nvidia-desktop"
+    ssh = "desktop"
+    label = "NVIDIA desktop"
+
 Every board is one long-lived ``tensorboard`` process bound to its own loopback
-port.  The dashboard never proxies board traffic, so board ports are part of the
-public contract: keep them stable so browser caches and bookmarks stay valid.
+port.  Browsers reach it through the dashboard port, at an origin of its own
+(``http://cleanrl.localhost:6005/``, see :mod:`tensorwatch.proxy`).  A remote is
+another machine's TensorWatch, reached over SSH, whose boards and queue the
+dashboard shows next to this machine's.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ import os
 import re
 import tomllib
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
 
@@ -33,6 +41,11 @@ APP_NAME: Final = "tensorwatch"
 #: Board names double as URL path segments, systemd-ish log file names and CLI
 #: arguments, so keep them boring.
 NAME_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+#: A remote's name is the middle label of its boards' hosts
+#: (``cleanrl.nvidia-desktop.localhost``) and names its SSH sockets, so it is a
+#: short DNS label.
+REMOTE_NAME_RE: Final = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$")
+DEFAULT_REMOTE_COMMAND: Final = "tensorwatch"
 
 DEFAULT_SERVER_HOST: Final = "127.0.0.1"
 DEFAULT_SERVER_PORT: Final = 6005
@@ -206,6 +219,25 @@ class QueueSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class RemoteSpec:
+    """Another machine's TensorWatch, reached over SSH."""
+
+    name: str
+    #: Destination handed to ``ssh``, usually a ``Host`` alias from
+    #: ``~/.ssh/config``, which supplies the user, key, port and the rest.
+    ssh: str
+    #: Shown in the dashboard; ``name`` when empty.
+    label: str = ""
+    #: How the remote's login shell runs TensorWatch.
+    command: str = DEFAULT_REMOTE_COMMAND
+    enabled: bool = True
+
+    @property
+    def title(self) -> str:
+        return self.label or self.name
+
+
+@dataclass(frozen=True)
 class Config:
     server: ServerSpec
     boards: tuple[BoardSpec, ...]
@@ -214,6 +246,21 @@ class Config:
     #: Boards whose port was auto-assigned during load; the CLI persists these so
     #: ports never move on the next start.
     assigned_ports: Mapping[str, int] = field(default_factory=dict)
+    remotes: tuple[RemoteSpec, ...] = ()
+
+    @cached_property
+    def hosts(self) -> Mapping[str, str]:
+        """Board name -> the host label of its origin (``<label>.localhost``)."""
+        from .proxy import assign_labels
+
+        return assign_labels(spec.name for spec in self.boards)
+
+    @cached_property
+    def by_label(self) -> Mapping[str, BoardSpec]:
+        return {self.hosts[spec.name]: spec for spec in self.boards}
+
+    def remote(self, name: str) -> RemoteSpec | None:
+        return next((spec for spec in self.remotes if spec.name == name), None)
 
     @property
     def board_dirs(self) -> dict[str, Path]:
@@ -230,6 +277,16 @@ class Config:
     def dashboard_url(self) -> str:
         host = "127.0.0.1" if self.server.host in ("0.0.0.0", "::") else self.server.host
         return f"http://{host}:{self.server.port}/"
+
+    def board_url(self, name: str) -> str:
+        """Where a browser on this machine reaches a board through the dashboard.
+
+        Every board is its own origin under ``localhost``, so TensorBoard's
+        per-origin settings and the browser's per-host connection limit stay
+        per board, while one port (one tunnel) reaches them all. A remote's
+        board is one level further down, at ``<label>.<remote>.localhost``.
+        """
+        return f"http://{self.hosts[name]}.localhost:{self.server.port}/"
 
 
 def _fmt_number(value: float) -> str:
@@ -429,7 +486,7 @@ def parse(text: str, path: Path | None = None) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path or '<config>'}: {exc}") from exc
 
-    unknown = sorted(set(data) - {"server", "defaults", "board", "queue"})
+    unknown = sorted(set(data) - {"server", "defaults", "board", "queue", "remote"})
     if unknown:
         raise ConfigError(f"unknown top-level table(s): {', '.join(unknown)}")
 
@@ -469,12 +526,48 @@ def parse(text: str, path: Path | None = None) -> Config:
         assigned[spec.name] = port
         resolved.append(BoardSpec(**{**_as_dict(spec), "port": port}))
 
+    raw_remotes = data.get("remote") or []
+    if not isinstance(raw_remotes, list):
+        raise ConfigError("remote must be an array of tables ([[remote]])")
+    remotes = [_remote_from(raw, i) for i, raw in enumerate(raw_remotes)]
+    names = [spec.name for spec in remotes]
+    dupes = sorted({name for name in names if names.count(name) > 1})
+    if dupes:
+        raise ConfigError(f"duplicate remote name(s) {', '.join(map(repr, dupes))}")
+
     return Config(
         server=server,
         boards=tuple(resolved),
         path=path or config_path(),
         queue=queue,
         assigned_ports=assigned,
+        remotes=tuple(remotes),
+    )
+
+
+def _remote_from(raw: Mapping[str, Any], index: int) -> RemoteSpec:
+    if not isinstance(raw, Mapping):
+        raise ConfigError(f"remote[{index}]: expected a table")
+    reader = _Reader(raw, f"remote[{index}]")
+    reader.unknown(("name", "ssh", "label", "command", "enabled"))
+    name = reader.str_("name") or ""
+    if not REMOTE_NAME_RE.match(name):
+        raise ConfigError(
+            f"remote[{index}]: invalid name {name!r} (lowercase letters, digits and -, "
+            "at most 32 characters; it becomes part of each board's host name)"
+        )
+    ssh = (reader.str_("ssh") or "").strip()
+    if not ssh or ssh.startswith("-") or any(char.isspace() for char in ssh):
+        raise ConfigError(f"remote {name!r}: ssh must be one destination, such as a Host alias")
+    command = (reader.str_("command", DEFAULT_REMOTE_COMMAND) or "").strip()
+    if not command:
+        raise ConfigError(f"remote {name!r}: command must not be empty")
+    return RemoteSpec(
+        name=name,
+        ssh=ssh,
+        label=(reader.str_("label", "") or "").strip(),
+        command=command,
+        enabled=reader.bool_("enabled", True),
     )
 
 

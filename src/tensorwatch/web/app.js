@@ -4,8 +4,11 @@
  * TensorWatch dashboard.
  *
  * Performance contract:
- *  - Boards are iframed straight at their own loopback port, so TensorBoard's
- *    data traffic never passes through the manager process.
+ *  - Every board is framed at an origin of its own on the dashboard's port:
+ *    `<board>.localhost`, or `<board>.<remote>.localhost` for another
+ *    machine's. The manager relays those requests to the board as streams,
+ *    which costs about 0.15 ms a request, so one port (one SSH tunnel) reaches
+ *    everything while each board keeps its own settings and connection pool.
  *  - Panes mount on first view; least-recently-used panes are unmounted past
  *    `server.keep_warm`, because a hidden iframe keeps a whole TensorBoard
  *    front-end (tens of MB of heap plus its own polling) alive.
@@ -40,7 +43,6 @@ const els = {
   queueChev: $("queue-chev"),
   queueJobs: $("queue-jobs"),
   queueMore: $("queue-more"),
-  queueError: $("queue-error"),
   palette: $("palette"),
   paletteIcon: $("palette-icon"),
   paletteInput: $("palette-input"),
@@ -75,7 +77,14 @@ const QUEUE_KEY = "tensorwatch.queue.collapsed";
 const THEME_KEY = "tensorwatch.theme";
 const RAIL_KEY = "tensorwatch.rail";
 
-let state = { boards: [], queue: null, server: { keep_warm: 2, queue_visible: 5 } };
+/**
+ * The latest state frame, with every machine's boards in one list. A remote
+ * board's `name` is `board@remote`, the name `tensorwatch open` takes; `short`
+ * is its name over there. Jobs carry a `key` the same way.
+ */
+let state = { boards: [], queue: null, remotes: [], server: { keep_warm: 2, queue_visible: 5 } };
+/** Every machine's mlq queue: {machine, label, snapshot, base}, this machine's first. */
+let queues = [];
 let active = localStorage.getItem(ACTIVE_KEY) || null;
 let viewKey = "";
 let framePending = false;
@@ -104,8 +113,10 @@ const frames = new Map();
 const lru = [];
 /** name -> {el, name, meta, ...} */
 const boardRows = new Map();
-/** job id -> {el, ...} */
+/** job key -> {el, ...} */
 const jobRows = new Map();
+/** machine ("" for this one) -> its header row in the board list */
+const machineHeads = new Map();
 
 /* --------------------------------------------------------------- formatting */
 
@@ -148,9 +159,71 @@ function shortPath(path) {
 
 /** name -> board, rebuilt with each state so lookups in render loops stay O(1). */
 let boardIndex = new Map();
+let remoteIndex = new Map();
 const byName = (name) => boardIndex.get(name) || null;
-const queue = () => state.queue;
-const allJobs = () => (queue() ? [...queue().running, ...queue().queued] : []);
+const allJobs = () => queues.flatMap((group) => [...group.snapshot.running, ...group.snapshot.queued]);
+const jobByKey = (key) => allJobs().find((job) => job.key === key) || null;
+const queueOf = (job) => queues.find((group) => group.machine === (job.remote || "")) || null;
+
+/* ---------------------------------------------------------------- machines */
+
+const remoteNamed = (name) => (name ? remoteIndex.get(name) || null : null);
+const remoteOf = (board) => remoteNamed(board && board.remote);
+/** Whether requests to the board can get there now; this machine's always can. */
+const reachable = (board) => !board.remote || remoteOf(board)?.state === "connected";
+/** Where a machine's own API is reached from this dashboard. */
+const apiBase = (remote) => (remote ? `/api/remotes/${encodeURIComponent(remote)}` : "");
+/** A dashboard name split back into the board's own name and its machine. */
+function splitName(name) {
+  const at = name.lastIndexOf("@");
+  return at > 0 ? [name.slice(0, at), name.slice(at + 1)] : [name, null];
+}
+const titleOf = (board) => (board.remote ? `${board.short} on ${board.machine}` : board.name);
+const localLabel = () => "This machine";
+
+/** The board's own origin: TensorBoard keeps its settings per origin. */
+function boardURL(board) {
+  const host = board.remote ? `${board.host}.${board.remote}` : board.host;
+  return `${location.protocol}//${host}.localhost${location.port ? `:${location.port}` : ""}/`;
+}
+
+const REMOTE_PROBLEM = {
+  unreachable: "Unreachable",
+  auth: "SSH login refused",
+  host_key: "Host key not trusted",
+  missing: "TensorWatch not installed",
+  too_old: "TensorWatch too old",
+  failed: "Connection failed",
+};
+
+/** A remote's connection in a few words, for its header and tooltips. */
+function remoteWords(link) {
+  if (!link.enabled) return { text: "Turned off", tone: "", title: `tensorwatch remote set ${link.name} --enable turns it back on` };
+  const route = `ssh ${link.ssh}`;
+  switch (link.state) {
+    case "connected":
+      return {
+        text: link.hostname || "",
+        tone: "",
+        title: [`Connected with ${route}`, link.version && `TensorWatch ${link.version}`,
+          link.latency_ms !== null && link.latency_ms !== undefined && `${Math.round(link.latency_ms)} ms round trip`]
+          .filter(Boolean).join(" · "),
+      };
+    case "connecting":
+      return { text: "Connecting…", tone: "warn", title: `Connecting with ${route}` };
+    case "error":
+      return { text: REMOTE_PROBLEM[link.error?.kind] || "Not connected", tone: "bad", title: link.error?.message || "" };
+    default:
+      return { text: "Not connected", tone: "", title: "Connects while a TensorWatch window is open" };
+  }
+}
+
+function retryRemote(name) {
+  const link = remoteNamed(name);
+  post(`${apiBase(name)}/retry`)
+    .then(() => say(`Reconnecting to ${link ? link.label : name}`))
+    .catch(reportError);
+}
 
 /* ------------------------------------------------------------------ words */
 
@@ -364,8 +437,8 @@ const liveField = (kind, id, el) => {
   return el;
 };
 const LIVE = {
-  mem: (b) => (b.state === "running" ? fmtBytes(b.rss_bytes) : "–"),
-  cpu: (b) => (b.state === "running" ? `${(b.cpu_percent || 0).toFixed(1)}%` : "–"),
+  mem: (b) => (b.state === "running" && reachable(b) ? fmtBytes(b.rss_bytes) : "–"),
+  cpu: (b) => (b.state === "running" && reachable(b) ? `${(b.cpu_percent || 0).toFixed(1)}%` : "–"),
 };
 
 function patchLive(container) {
@@ -374,7 +447,7 @@ function patchLive(container) {
   for (const el of container.querySelectorAll("[data-live]")) {
     const [kind, id] = el.dataset.live.split(/:(.*)/s);
     if (kind === "memtotal") {
-      el.textContent = fmtBytes(state.boards.reduce((sum, b) => sum + (b.state === "running" ? b.rss_bytes || 0 : 0), 0));
+      el.textContent = fmtBytes(state.boards.reduce((sum, b) => sum + (b.state === "running" && reachable(b) ? b.rss_bytes || 0 : 0), 0));
       continue;
     }
     const board = byName(id);
@@ -422,7 +495,11 @@ async function request(method, path, body) {
 }
 
 const post = (path, body) => request("POST", path, body);
-const boardPath = (name) => `/api/boards/${encodeURIComponent(name)}`;
+/** A board's API on whichever machine runs it. */
+function boardPath(name) {
+  const [short, remote] = splitName(name);
+  return `${apiBase(remote)}/api/boards/${encodeURIComponent(short)}`;
+}
 const act = (name, action) => post(`${boardPath(name)}/${action}`);
 
 /**
@@ -439,7 +516,7 @@ function setMode(name, mode) {
   const board = byName(name);
   if (!board || board.autostart === mode) return;
   post(`${boardPath(name)}/autostart`, { mode })
-    .then(() => say(`${name} now runs ${({ always: "always", on_demand: "on demand", manual: "only when started" })[mode]}`))
+    .then(() => say(`${titleOf(board)} now runs ${({ always: "always", on_demand: "on demand", manual: "only when started" })[mode]}`))
     .catch(reportError);
 }
 
@@ -577,8 +654,8 @@ function mount(name) {
     if (!board) return null;
     frame = document.createElement("iframe");
     frame.className = "pane";
-    frame.src = board.url;
-    frame.title = `TensorBoard: ${name}`;
+    frame.src = boardURL(board);
+    frame.title = `TensorBoard: ${titleOf(board)}`;
     frame.setAttribute("referrerpolicy", "no-referrer");
     els.panes.insertBefore(frame, els.view);
     frames.set(name, frame);
@@ -628,7 +705,7 @@ function select(name) {
   closeMenu();
   revealActive = true;
   const board = byName(name);
-  if (board) {
+  if (board && reachable(board)) {
     // The heartbeat starts on_demand boards without pinning them running.
     // Only a stopped board with another policy needs an explicit start: a
     // crashing or failing one is already wanted, and `start` would reset its
@@ -655,13 +732,14 @@ function showOverview() {
  * the board, so it keeps TensorWatch running after this window closes.
  */
 function detach(name) {
-  if (byName(name)) window.open(`/boards/${encodeURIComponent(name)}`, `tb-${name}`, "noopener");
+  // `@` stays readable in the address bar; nothing else in a name needs escaping.
+  if (byName(name)) window.open(`/boards/${encodeURIComponent(name).replace("%40", "@")}`, `tb-${name}`, "noopener");
 }
 
 function reloadPane(name) {
   const frame = frames.get(name);
   const board = byName(name);
-  if (frame && board) frame.src = board.url;
+  if (frame && board) frame.src = boardURL(board);
 }
 
 /* ------------------------------------------------------------------ render */
@@ -707,15 +785,19 @@ function render() {
 
 function renderTotals() {
   els.boardsCount.textContent = state.boards.length ? `${state.boards.length}` : "";
-  const failed = state.boards.filter((b) => b.state === "failed").length;
-  const crashing = state.boards.filter(isCrashing).length;
-  const running = state.boards.filter((b) => b.state === "running");
+  // A disconnected machine's boards show their last known state; they count as nothing.
+  const live = state.boards.filter(reachable);
+  const failed = live.filter((b) => b.state === "failed").length;
+  const crashing = live.filter(isCrashing).length;
+  const running = live.filter((b) => b.state === "running");
+  const lost = state.remotes.filter((link) => link.enabled && link.state === "error").length;
   els.ovCount.textContent = failed
     ? `${failed} can't start`
     : crashing
       ? `${crashing} crashing`
-      : state.boards.length ? `${running.length} of ${state.boards.length} running` : "";
-  els.ovCount.className = `count${failed ? " bad" : crashing ? " warn" : ""}`;
+      : lost ? `${lost} machine${lost === 1 ? "" : "s"} unreachable`
+        : state.boards.length ? `${running.length} of ${state.boards.length} running` : "";
+  els.ovCount.className = `count${failed || lost ? " bad" : crashing ? " warn" : ""}`;
   els.navOverview.classList.toggle("active", active === null);
 
   if (streamDown) {
@@ -743,14 +825,14 @@ function boardRow(board) {
   const name = board.name;
 
   const dot = h("span", { class: "dot", "aria-hidden": "true" });
-  const label = h("span", { class: "b-name", text: name });
+  const label = h("span", { class: "b-name", text: board.short });
   const live = h("span", { class: "act", hidden: true });
   const jobs = h("span", { class: "pill", hidden: true });
   const idx = h("span", { class: "b-key", "aria-hidden": "true" });
   const meta = h("span", { class: "b-meta" });
   const warm = h("span", { title: "Kept loaded for instant switching", hidden: true }, icon("pane"));
   const demand = h("span", { title: MODE_HINT.on_demand, hidden: true }, icon("moon"));
-  const more = iconButton("more", `Actions for ${name}`, (event) => {
+  const more = iconButton("more", `Actions for ${titleOf(board)}`, (event) => {
     event.stopPropagation();
     toggleMenu(name, more);
   }, "icon-btn b-more");
@@ -786,8 +868,7 @@ function boardRow(board) {
       openMenu(name, box.left + 40, box.bottom, el);
     }
   });
-  els.boards.appendChild(el);
-
+  // renderBoards puts it in place, between its machine's header and the next.
   row = { el, dot, live, jobs, idx, meta, warm, demand, ext, key: "", extKey: "" };
   boardRows.set(name, row);
   return row;
@@ -795,25 +876,25 @@ function boardRow(board) {
 
 /** Move focus to the next visible board row; the list is short, so no roving index. */
 function focusNeighbour(el, step) {
-  const rows = [...els.boards.children].filter((row) => !row.classList.contains("hidden"));
+  const rows = [...els.boards.children].filter((row) => row.dataset.name && !row.classList.contains("hidden"));
   const next = rows[rows.indexOf(el) + step];
   if (next) next.focus();
   return Boolean(next);
 }
 
-/** board name -> {running: QueueJob[], queued: QueueJob[]} from the mlq snapshot. */
+/** board name -> {running: QueueJob[], queued: QueueJob[]} from every machine's queue. */
 function activityByBoard() {
   const map = new Map();
-  const snapshot = queue();
-  if (!snapshot) return map;
-  for (const [bucket, jobs] of [["running", snapshot.running], ["queued", snapshot.queued]]) {
-    for (const job of jobs) {
-      // A job can belong to more than one board (a project with a live logdir and
-      // an archive): mark all of them.
-      for (const name of job.boards || []) {
-        const entry = map.get(name) || { running: [], queued: [] };
-        entry[bucket].push(job);
-        map.set(name, entry);
+  for (const { snapshot } of queues) {
+    for (const [bucket, jobs] of [["running", snapshot.running], ["queued", snapshot.queued]]) {
+      for (const job of jobs) {
+        // A job can belong to more than one board (a project with a live logdir and
+        // an archive): mark all of them.
+        for (const name of job.boards || []) {
+          const entry = map.get(name) || { running: [], queued: [] };
+          entry[bucket].push(job);
+          map.set(name, entry);
+        }
       }
     }
   }
@@ -824,7 +905,10 @@ const EMPTY_WORK = { running: [], queued: [] };
 
 /** Tooltip for a row: where it reads from, what the supervisor says, and its jobs. */
 function rowTitle(board, work, live, number) {
+  const link = remoteOf(board);
   const lines = [board.target, `${stateWord(board)}: ${board.message || board.state}`];
+  if (link) lines.unshift(`${board.short} on ${link.label}`);
+  if (link && !reachable(board)) lines.push(`${link.label} is not connected; this is its last known state`);
   if (board.last_event) {
     lines.push(board.writing ? `Receiving data, last write ${fmtAge(board.last_event)} ago`
       : `Quiet, last write ${fmtAge(board.last_event)} ago`);
@@ -838,17 +922,72 @@ function rowTitle(board, work, live, number) {
 
 const needleNow = () => els.filter.value.trim().toLowerCase();
 const matchesFilter = (board, needle) =>
-  !needle || `${board.name} ${board.target}`.toLowerCase().includes(needle);
+  !needle || `${board.name} ${board.machine || ""} ${board.target}`.toLowerCase().includes(needle);
 const visibleBoards = () => state.boards.filter((board) => matchesFilter(board, needleNow()));
+
+/** A machine's header in the board list; only shown once there are remotes. */
+function machineHead(link) {
+  const id = link ? link.name : "";
+  let head = machineHeads.get(id);
+  if (!head) {
+    const name = h("span", { class: "m-name" });
+    const meta = h("span", { class: "m-meta" });
+    const retry = link
+      ? iconButton("refresh", `Reconnect to ${link.label}`, () => retryRemote(id), "icon-btn m-retry")
+      : null;
+    const el = h("div", { class: "machine", role: "presentation", dataset: { machine: id } }, name, meta, retry);
+    head = { el, name, meta, retry, key: "" };
+    machineHeads.set(id, head);
+  }
+  const words = link ? remoteWords(link) : { text: state.server.hostname || "", tone: "", title: "" };
+  const label = link ? link.label : localLabel();
+  const key = [label, words.text, words.tone, words.title].join("|");
+  if (head.key !== key) {
+    head.key = key;
+    head.name.textContent = label;
+    head.meta.textContent = words.text;
+    head.meta.className = `m-meta${words.tone ? ` ${words.tone}` : ""}`;
+    head.el.title = words.title;
+    if (head.retry) {
+      head.retry.hidden = link.state !== "error";
+      setLabel(head.retry, `Reconnect to ${label}`);
+    }
+  }
+  return head.el;
+}
+
+/** A row's state, counting a disconnected machine as one. */
+const rowState = (board) => (reachable(board) ? shownState(board) : "offline");
+
+function rowSummary(board) {
+  if (reachable(board)) return summary(board);
+  const link = remoteOf(board);
+  return link && link.state === "connecting" ? "Connecting…" : "Offline · last known state";
+}
 
 function renderBoards() {
   const needle = needleNow();
   let shown = 0;
   const activity = activityByBoard();
-  const live = Boolean(queue() && queue().connected);
   const seen = new Set();
+  // With remotes, the list is grouped by machine. This machine's group is left
+  // out when it has no boards, so a laptop that only watches others shows theirs.
+  const grouped = state.remotes.length > 0;
+  const nodes = [];
+  const heads = new Set();
+  const head = (link) => {
+    const el = machineHead(link);
+    heads.add(link ? link.name : "");
+    nodes.push(el);
+  };
+  let machine;
 
-  state.boards.forEach((board, index) => {
+  if (grouped && state.boards.some((board) => !board.remote)) head(null);
+  state.boards.forEach((board) => {
+    if (grouped && board.remote && board.remote !== machine) {
+      machine = board.remote;
+      head(remoteOf(board));
+    }
     const row = boardRow(board);
     seen.add(board.name);
     const filtered = !matchesFilter(board, needle);
@@ -856,22 +995,25 @@ function renderBoards() {
     const number = filtered ? 0 : ++shown;
     const work = activity.get(board.name) || EMPTY_WORK;
     const isActive = board.name === active;
-    const meta = summary(board);
-    const age = board.writing ? fmtAge(board.last_event) : "";
+    const meta = rowSummary(board);
+    const age = board.writing && reachable(board) ? fmtAge(board.last_event) : "";
+    const live = Boolean(queueOf({ remote: board.remote })?.snapshot.connected);
     const title = rowTitle(board, work, live, number);
+    const index = nodes.length;
     const key = [
-      shownState(board), meta, isActive, frames.has(board.name), index, number, filtered, age, title,
+      rowState(board), meta, isActive, frames.has(board.name), index, number, filtered, age, title,
       work.running.length, work.queued.length, board.autostart,
     ].join("|");
+    nodes.push(row.el);
     if (row.key !== key) {
       row.key = key;
-      row.el.className = `board state-${shownState(board)}${isActive ? " active" : ""}${filtered ? " hidden" : ""}`;
+      row.el.className = `board state-${rowState(board)}${isActive ? " active" : ""}${filtered ? " hidden" : ""}`;
       row.el.setAttribute("aria-selected", String(isActive));
       row.el.title = title;
-      row.dot.className = `dot ${shownState(board)}`;
+      row.dot.className = `dot ${rowState(board)}`;
       row.meta.textContent = meta;
-      row.live.hidden = !board.writing;
-      if (board.writing) row.live.replaceChildren(icon("wave"), age);
+      row.live.hidden = !age;
+      if (age) row.live.replaceChildren(icon("wave"), age);
       const running = work.running.length;
       const waiting = work.queued.length;
       row.jobs.hidden = !running && !waiting;
@@ -887,10 +1029,11 @@ function renderBoards() {
       row.demand.hidden = board.autostart !== "on_demand";
     }
     renderExt(row, board, isActive);
-    // Keep DOM order in sync with registry order without rebuilding rows.
-    const expected = els.boards.children[index];
-    if (expected !== row.el) els.boards.insertBefore(row.el, expected || null);
   });
+  // A remote that never connected has no boards, but its header says why.
+  for (const link of state.remotes) {
+    if (!heads.has(link.name)) head(link);
+  }
 
   for (const [name, row] of boardRows) {
     if (!seen.has(name)) {
@@ -898,9 +1041,20 @@ function renderBoards() {
       boardRows.delete(name);
     }
   }
+  for (const [id, item] of machineHeads) {
+    if (!heads.has(id)) {
+      item.el.remove();
+      machineHeads.delete(id);
+    }
+  }
+  // Keep DOM order in sync with registry order without rebuilding rows.
+  nodes.forEach((node, index) => {
+    const expected = els.boards.children[index];
+    if (expected !== node) els.boards.insertBefore(node, expected || null);
+  });
 
   const empty = !state.boards.length
-    ? "No boards yet. Add a log directory with +."
+    ? (state.remotes.length ? "" : "No boards yet. Add a log directory with +.")
     : shown ? "" : `No board matches “${els.filter.value.trim()}”.`;
   els.boardsEmpty.hidden = !empty;
   els.boardsEmpty.textContent = empty;
@@ -912,7 +1066,7 @@ function renderBoards() {
 /** The open board's row also carries its path, run policy and actions. */
 function renderExt(row, board, isActive) {
   const running = isOn(board);
-  const key = isActive ? [board.state, board.autostart, board.target, board.port].join("|") : "";
+  const key = isActive ? [board.state, board.autostart, board.target, board.port, board.machine].join("|") : "";
   if (row.extKey === key) return;
   row.extKey = key;
   row.ext.hidden = !isActive;
@@ -932,10 +1086,10 @@ function renderExt(row, board, isActive) {
   row.ext.replaceChildren(
     h("div", { class: "b-path" },
       h("button", { type: "button", title: `${board.target}\nClick to copy`, onclick: () => copy(board.target, "the path") }, shortPath(board.target)),
-      h("span", { text: `port ${board.port}` })),
+      h("span", { text: board.remote ? board.machine : `port ${board.port}` })),
     modes,
     h("div", { class: "b-acts" },
-      iconButton("restart", "Restart TensorBoard", () => act(name, "restart").then(() => say(`Restarting ${name}`)).catch(reportError)),
+      iconButton("restart", "Restart TensorBoard", () => act(name, "restart").then(() => say(`Restarting ${titleOf(board)}`)).catch(reportError)),
       power,
       iconButton("log", "Log (l)", () => showLogs(name)),
       iconButton("external", "Open in its own window (d)", () => detach(name)),
@@ -954,14 +1108,57 @@ function closeActive() {
 /* ------------------------------------------------------------------- queue */
 
 const subHeads = new Map();
-const subHead = (text) => {
-  if (!subHeads.has(text)) subHeads.set(text, h("div", { class: "rq-sub", text }));
-  return subHeads.get(text);
+const subHead = (id, text = id) => {
+  if (!subHeads.has(id)) subHeads.set(id, h("div", { class: "rq-sub", text }));
+  return subHeads.get(id);
 };
+/** machine -> {el, ...}: a machine's name, slots and errors above its jobs */
+const queueHeads = new Map();
+
+/** Several machines' queues, or another machine's alone, are labelled by machine. */
+const queuesGrouped = () => queues.length > 1 || Boolean(queues[0]?.machine);
+
+function slotBar(snapshot) {
+  const limit = snapshot.effective_limit;
+  return snapshot.connected && limit
+    ? h("span", { class: "slots", title: `${snapshot.active_leases} of ${limit} slots in use` },
+      ...Array.from({ length: Math.min(limit, 8) }, (_, i) => h("i", { class: i < snapshot.active_leases ? "on" : null })))
+    : null;
+}
+
+const queueWord = (snapshot) =>
+  !snapshot.connected ? "offline" : snapshot.admission_blocked ? "admission blocked" : `${snapshot.queued.length} waiting`;
+const queueTone = (snapshot) => (!snapshot.connected ? " bad" : snapshot.admission_blocked ? " warn" : "");
+
+/** A machine's line in the queue panel, and the notice when its mlq is unreachable. */
+function queueHead(group, grouped) {
+  let head = queueHeads.get(group.machine);
+  if (!head) {
+    const name = h("span", { class: "m-name" });
+    const meta = h("span", { class: "sect-meta" });
+    const error = h("div", { class: "queue-error" });
+    head = { el: h("div", { class: "rq-machine" }, name, h("span", { class: "grow" }), meta), name, meta, error, key: "" };
+    queueHeads.set(group.machine, head);
+  }
+  const { snapshot } = group;
+  const key = [group.label, snapshot.connected, snapshot.admission_blocked, snapshot.active_leases,
+    snapshot.effective_limit, snapshot.queued.length, snapshot.error].join("|");
+  if (head.key !== key) {
+    head.key = key;
+    head.name.textContent = group.label;
+    head.meta.className = `sect-meta${queueTone(snapshot)}`;
+    head.meta.replaceChildren(...[slotBar(snapshot)].filter(Boolean), queueWord(snapshot));
+    // Daemon errors can be paragraphs; keep the panel small and put the rest in the tooltip.
+    const detail = (snapshot.error || "").replace(/\s+/g, " ");
+    const who = grouped ? `${group.label}: mlq` : "mlq";
+    head.error.textContent = `${who} isn't responding. Showing the last known state.${detail ? ` ${detail}` : ""}`;
+    head.error.title = detail;
+  }
+  return head;
+}
 
 function renderQueue() {
-  const snapshot = queue();
-  if (!snapshot) {
+  if (!queues.length) {
     els.queue.hidden = true;
     for (const [id, row] of jobRows) {
       row.el.remove();
@@ -975,58 +1172,70 @@ function renderQueue() {
   els.queue.classList.toggle("expanded", queueExpanded);
   els.queueHead.setAttribute("aria-expanded", String(!collapsed));
   els.queueMore.setAttribute("aria-expanded", String(queueExpanded));
+  const grouped = queuesGrouped();
 
-  const limit = snapshot.effective_limit;
-  const slots = snapshot.connected && limit
-    ? h("span", { class: "slots", title: `${snapshot.active_leases} of ${limit} slots in use` },
-      ...Array.from({ length: Math.min(limit, 8) }, (_, i) => h("i", { class: i < snapshot.active_leases ? "on" : null })))
-    : null;
-  const metaKey = [snapshot.connected, snapshot.admission_blocked, snapshot.active_leases, limit, snapshot.queued.length].join("|");
+  // One machine: its slots and state. Several: each says so on its own line,
+  // and the header adds up what is waiting.
+  const only = grouped ? null : queues[0].snapshot;
+  const waiting = queues.reduce((sum, group) => sum + group.snapshot.queued.length, 0);
+  const offline = queues.filter((group) => !group.snapshot.connected).length;
+  const metaKey = only
+    ? [only.connected, only.admission_blocked, only.active_leases, only.effective_limit, only.queued.length].join("|")
+    : `${waiting}|${offline}|${queues.length}`;
   if (els.queueMeta.dataset.key !== metaKey) {
     els.queueMeta.dataset.key = metaKey;
-    els.queueMeta.className = `sect-meta${!snapshot.connected ? " bad" : snapshot.admission_blocked ? " warn" : ""}`;
-    els.queueMeta.replaceChildren(
-      ...(slots ? [slots] : []),
-      !snapshot.connected ? "offline" : snapshot.admission_blocked ? "admission blocked" : `${snapshot.queued.length} waiting`,
-    );
+    if (only) {
+      els.queueMeta.className = `sect-meta${queueTone(only)}`;
+      els.queueMeta.replaceChildren(...[slotBar(only)].filter(Boolean), queueWord(only));
+    } else {
+      els.queueMeta.className = `sect-meta${offline === queues.length ? " bad" : offline ? " warn" : ""}`;
+      els.queueMeta.replaceChildren(offline === queues.length ? "offline" : `${waiting} waiting`);
+    }
   }
-  // Daemon errors can be paragraphs; keep the panel small and put the rest in the tooltip.
-  const detail = (snapshot.error || "").replace(/\s+/g, " ");
-  els.queueError.hidden = Boolean(snapshot.connected);
-  els.queueError.textContent = `mlq isn't responding. Showing the last known state.${detail ? ` ${detail}` : ""}`;
-  els.queueError.title = detail;
 
   // Running jobs always show (there are only as many as slots), then the open
   // board's waiting jobs, then the remaining jobs within the preview limit.
   const visible = Math.max(1, state.server.queue_visible || 5);
-  const mine = [];
-  const rest = [];
-  for (const job of snapshot.queued) {
-    (active && job.boards?.includes(active) ? mine : rest).push(job);
-  }
-  const budget = Math.max(0, visible - snapshot.running.length - mine.length);
-  const shownRest = queueExpanded ? rest : rest.slice(0, budget);
   const focused = document.activeElement;
   const hadFocus = focused && els.queueJobs.contains?.(focused);
   const nodes = [];
   const seen = new Set();
-  const add = (job) => {
-    seen.add(job.id);
-    nodes.push(jobRow(job, snapshot).el);
-  };
-  if (snapshot.running.length) {
-    nodes.push(subHead("Running"));
-    snapshot.running.forEach(add);
-  }
-  if (mine.length) {
-    nodes.push(subHead(`${active}'s jobs`));
-    mine.forEach(add);
-  }
-  if (shownRest.length) {
-    nodes.push(subHead(mine.length ? "Other jobs" : "Waiting"));
-    shownRest.forEach(add);
+  const heads = new Set();
+  let hidden = 0;
+  for (const group of queues) {
+    const { snapshot, machine } = group;
+    const head = queueHead(group, grouped);
+    heads.add(machine);
+    if (grouped) nodes.push(head.el);
+    if (!snapshot.connected) nodes.push(head.error);
+    const mine = [];
+    const rest = [];
+    for (const job of snapshot.queued) {
+      (active && job.boards?.includes(active) ? mine : rest).push(job);
+    }
+    const budget = Math.max(0, visible - snapshot.running.length - mine.length);
+    const shownRest = queueExpanded ? rest : rest.slice(0, budget);
+    hidden += rest.length - shownRest.length;
+    const add = (job) => {
+      seen.add(job.key);
+      nodes.push(jobRow(job, snapshot).el);
+    };
+    if (snapshot.running.length) {
+      nodes.push(subHead(`${machine}|Running`, "Running"));
+      snapshot.running.forEach(add);
+    }
+    if (mine.length) {
+      const board = byName(active);
+      nodes.push(subHead(`${machine}|${active}`, `${board ? board.short : active}'s jobs`));
+      mine.forEach(add);
+    }
+    if (shownRest.length) {
+      nodes.push(subHead(`${machine}|${mine.length ? "Other jobs" : "Waiting"}`, mine.length ? "Other jobs" : "Waiting"));
+      shownRest.forEach(add);
+    }
   }
   for (const [id] of jobRows) if (!seen.has(id)) jobRows.delete(id);
+  for (const [id] of queueHeads) if (!heads.has(id)) queueHeads.delete(id);
   const current = els.queueJobs.children;
   if (current.length !== nodes.length || nodes.some((node, i) => current[i] !== node)) {
     const scroll = els.queueJobs.scrollTop;
@@ -1041,7 +1250,6 @@ function renderQueue() {
     }
   }
 
-  const hidden = rest.length - shownRest.length;
   const moreText = queueExpanded ? "Show compact queue" : `${hidden > 0 ? `${hidden} more · ` : ""}Show full queue`;
   if (els.queueMore.dataset.key !== moreText) {
     els.queueMore.dataset.key = moreText;
@@ -1061,16 +1269,16 @@ function toggleQueueExpanded(expand = !queueExpanded) {
 
 /** One line per job: its name, then whatever is unusual about it. The rest is in the tooltip. */
 function jobRow(job, snapshot) {
-  let row = jobRows.get(job.id);
+  let row = jobRows.get(job.key);
   if (!row) {
     const glyph = h("span", { class: "glyph" });
     const name = h("span", { class: "jname" });
     const when = h("span", { class: "when" });
-    const link = h("button", { type: "button", class: "job", onclick: () => openJobBoard(job.id) }, glyph, name, when);
-    const cancel = h("button", { type: "button", class: "btn sm", onclick: () => cancelJob(job.id) });
+    const link = h("button", { type: "button", class: "job", onclick: () => openJobBoard(job.key) }, glyph, name, when);
+    const cancel = h("button", { type: "button", class: "btn sm", onclick: () => cancelJob(job.key) });
     const el = h("div", { class: "queue-job" }, link, cancel);
     row = { el, link, cancel, glyph, name, when, key: "", actionKey: "" };
-    jobRows.set(job.id, row);
+    jobRows.set(job.key, row);
   }
   const running = job.state === "running";
   const tries = Number.parseInt(job.attempts, 10) || 0;
@@ -1081,10 +1289,10 @@ function jobRow(job, snapshot) {
         : job.priority ? `priority ${job.priority}` : "";
   const tag = job.board || (job.boards || [])[0] || "";
   const title = [
-    `#${job.id} ${job.name}`,
+    `#${job.id} ${job.name}${job.remote ? ` on ${remoteNamed(job.remote)?.label || job.remote}` : ""}`,
     running ? (job.since ? `Running for ${dur(nowSec() - job.since, true)}` : "Running") : reasonText(job.reason),
     running && tries > 1 ? `Attempt ${job.attempts}` : "",
-    `${tag ? `Board: ${tag}` : `Project: ${job.project}`} · ${job.cwd}`,
+    `${tag ? `Board: ${splitName(tag)[0]}` : `Project: ${job.project}`} · ${job.cwd}`,
     snapshot.connected ? "" : "mlq is offline; this is the last known state",
   ].filter(Boolean).join("\n");
   const linked = Boolean(tag && byName(tag));
@@ -1112,43 +1320,43 @@ function jobRow(job, snapshot) {
   return row;
 }
 
-function openJobBoard(id) {
-  const job = allJobs().find((candidate) => candidate.id === id);
+function openJobBoard(key) {
+  const job = jobByKey(key);
   const target = job && (job.board || (job.boards || [])[0]);
   if (target && byName(target)) select(target);
 }
 
 /** Kill and cancel take a second click within 3 s; a stray click costs a job hours. */
-const isJobArmed = (job) => armed.get(job.id)?.running === (job.state === "running");
+const isJobArmed = (job) => armed.get(job.key)?.running === (job.state === "running");
 
-function cancelJob(id) {
-  const job = allJobs().find((candidate) => candidate.id === id);
-  if (!job || !queue()?.connected) return;
+function cancelJob(key) {
+  const job = jobByKey(key);
+  const group = job && queueOf(job);
+  if (!job || !group?.snapshot.connected) return;
   const running = job.state === "running";
-  clearTimeout(armed.get(id)?.timer);
+  clearTimeout(armed.get(key)?.timer);
   if (!isJobArmed(job)) {
     const timer = setTimeout(() => {
-      armed.delete(id);
+      armed.delete(key);
       viewKey = "";
       schedule();
     }, 3000);
-    armed.set(id, { running, timer });
+    armed.set(key, { running, timer });
     viewKey = "";
     schedule();
     return;
   }
-  armed.delete(id);
+  armed.delete(key);
   viewKey = "";
-  post(`/api/queue/${job.id}/cancel`)
+  post(`${group.base}/api/queue/${job.id}/cancel`)
     .then(() => say(running ? `Stopping #${job.id} ${job.name}. Its slot frees up once it exits.` : `Cancelled #${job.id} ${job.name}`))
     .catch(reportError);
   schedule();
 }
 
-function queueTable() {
-  const snapshot = queue();
-  if (!snapshot) return h("p", { class: "muted", text: "mlq is not set up." });
-  const rows = allJobs().map((job) => {
+function queueTable(group) {
+  const { snapshot } = group;
+  const rows = [...snapshot.running, ...snapshot.queued].map((job) => {
     const running = job.state === "running";
     const tries = Number.parseInt(job.attempts, 10) || 0;
     const tag = job.board || (job.boards || [])[0] || "";
@@ -1158,15 +1366,15 @@ function queueTable() {
       ? (tries > 1 ? `Attempt ${job.attempts}` : "")
       : job.state === "held" ? "Held until released"
       : [reasonText(job.reason), job.priority ? `priority ${job.priority}` : ""].filter(Boolean).join(" · ");
-    return h("tr", { class: tag && byName(tag) ? "link" : null, tabindex: "0", dataset: { job: String(job.id) },
-      onclick: (event) => { if (!event.target.closest?.("button")) openJobBoard(job.id); },
-      onkeydown: (event) => { if (event.key === "Enter" && event.target === event.currentTarget) openJobBoard(job.id); } },
+    return h("tr", { class: tag && byName(tag) ? "link" : null, tabindex: "0", dataset: { job: job.key },
+      onclick: (event) => { if (!event.target.closest?.("button")) openJobBoard(job.key); },
+      onkeydown: (event) => { if (event.key === "Enter" && event.target === event.currentTarget) openJobBoard(job.key); } },
       h("td", {}, h("span", { class: `pill ${running ? "ok" : job.state === "held" ? "warn" : "soft"}`,
         text: running ? "Running" : job.state === "held" ? "On hold" : "Waiting" })),
       h("td", {}, h("b", { style: "font-weight:500", text: job.name }), " ", h("span", { class: "muted", text: `#${job.id}` })),
       h("td", {}, tag && byName(tag)
-        ? h("button", { type: "button", class: "boardlink", text: tag, dataset: { act: `open:${job.id}` }, onclick: () => select(tag) })
-        : h("span", { class: "muted", text: tag || job.project })),
+        ? h("button", { type: "button", class: "boardlink", text: byName(tag).short, dataset: { act: `open:${job.key}` }, onclick: () => select(tag) })
+        : h("span", { class: "muted", text: tag ? splitName(tag)[0] : job.project })),
       h("td", {}, h("span", { class: "muted", text: details })),
       h("td", { class: "num when" }, running ? sinceOrDash(job.since, true)
         : job.queued_at ? h("span", { class: "muted" }, since(job.queued_at), " waiting") : h("span", { class: "muted", text: "–" })),
@@ -1176,13 +1384,13 @@ function queueTable() {
           h("span", { class: "muted", text: dur(job.time_limit) }))
         : h("span", { class: "muted", text: job.time_limit ? dur(job.time_limit) : "–" })),
       h("td", { class: "rowacts" }, snapshot.connected
-        ? h("button", { type: "button", class: `btn sm${isArmed ? " confirm" : ""}`, dataset: { cancel: String(job.id) },
-          onclick: () => cancelJob(job.id) },
+        ? h("button", { type: "button", class: `btn sm${isArmed ? " confirm" : ""}`, dataset: { cancel: job.key },
+          onclick: () => cancelJob(job.key) },
         isArmed ? (running ? "Really stop?" : "Really cancel?") : running ? "Stop job" : "Cancel")
         : null));
   });
   const error = !snapshot.connected
-    ? h("div", { class: "msg" }, icon("alert"), h("div", {}, h("b", { text: "mlq isn't responding." }),
+    ? h("div", { class: "msg" }, icon("alert"), h("div", {}, h("b", { text: queuesGrouped() ? `${group.label}: mlq isn't responding.` : "mlq isn't responding." }),
       " This is the last known state, and jobs can't be cancelled until it's back.",
       h("span", { class: "src", text: (snapshot.error || "").replace(/\s+/g, " ") })))
     : null;
@@ -1195,6 +1403,7 @@ function queueTable() {
 
 /** What the queue shows, without the timestamp the subscriber stamps on every poll. */
 const queueKey = (snapshot) => (snapshot ? { ...snapshot, updated_at: undefined } : null);
+const queuesKey = () => queues.map((group) => [group.machine, group.label, queueKey(group.snapshot)]);
 
 function queueSummary(snapshot) {
   if (!snapshot) return "";
@@ -1207,17 +1416,22 @@ function queueSummary(snapshot) {
 
 function renderPanes() {
   const board = active ? byName(active) : null;
-  if (board && board.state === "running") mount(board.name);
+  const up = Boolean(board && board.state === "running" && reachable(board));
+  if (up) mount(board.name);
   for (const [name, frame] of frames) frame.hidden = name !== active;
 
-  if (board && board.state === "running") {
+  if (up) {
     els.view.hidden = true;
     viewKey = "";
     statusLog = null;
     return;
   }
   els.view.hidden = false;
-  if (board) showStatusPage(board);
+  // A remote board shows its machine's trouble until it can be reached; one
+  // restored from the last session waits there for its machine's first frame.
+  const link = board ? remoteOf(board) : active ? remoteNamed(splitName(active)[1]) : null;
+  if (link && (!board || !reachable(board))) showRemotePage(link, board);
+  else if (board) showStatusPage(board);
   else showOverviewPage();
 }
 
@@ -1296,10 +1510,12 @@ function logLines(text) {
 
 function statusPage(board) {
   const name = board.name;
+  const title = titleOf(board);
   const log = statusLog && statusLog.name === name ? statusLog : null;
   const B = (label, handler, opts) => button(label, handler, opts);
-  const restart = () => act(name, "restart").then(() => say(`Restarting ${name}`)).catch(reportError);
+  const restart = () => act(name, "restart").then(() => say(`Restarting ${title}`)).catch(reportError);
   const facts = h("dl", { class: "facts" },
+    board.remote ? h("div", {}, h("dt", { text: "Machine" }), h("dd", { text: board.machine })) : null,
     h("div", {}, h("dt", { text: "Log directory" }), h("dd", { title: board.target, text: shortPath(board.target) })),
     h("div", {}, h("dt", { text: "Last new data" }), h("dd", {}, board.last_event ? [liveField("event", name, since(board.last_event)), " ago"] : "Never")),
     h("div", {}, h("dt", { text: "Mode" }), h("dd", { text: MODE_WORD[board.autostart] || board.autostart })),
@@ -1329,7 +1545,7 @@ function statusPage(board) {
       const pinned = board.autostart !== "on_demand";
       const crashes = `${board.restarts} crash${board.restarts === 1 ? "" : "es"} in a row`;
       return page({
-        title: `${name} keeps crashing`,
+        title: `${title} keeps crashing`,
         lead: pinned
           ? "TensorWatch restarts it on its own, waiting longer after each crash, up to a minute. Restart now skips the wait; Stop leaves it off until you start it."
           : "TensorWatch retries while the board is open, waiting longer after each crash, up to a minute. Restart now skips the wait; Stop leaves it off until you start it.",
@@ -1351,7 +1567,7 @@ function statusPage(board) {
       const early = preSpawn(board);
       const missing = (board.message || "").startsWith("logdir does not exist");
       return page({
-        title: `${name} can't start`,
+        title: `${title} can't start`,
         lead: early
           ? "TensorWatch checks this before launching TensorBoard and tries again every 30 seconds, so fixing the problem below is enough. Try again skips the wait."
           : "TensorBoard didn't start listening in time. TensorWatch tries again on its own, waiting longer each time.",
@@ -1364,21 +1580,21 @@ function statusPage(board) {
     }
     case "starting":
       return page({
-        title: board.autostart === "on_demand" ? `Waking up ${name}…` : `Starting ${name}…`,
+        title: board.autostart === "on_demand" ? `Waking up ${title}…` : `Starting ${title}…`,
         lead: "TensorBoard is reading the log directory. This page switches to it as soon as it's ready; big directories can take a minute.",
         acts: [B("Cancel", () => stopBoard(name), { iconName: "stop" })],
         extra: logbox(),
       });
     case "disabled":
       return page({
-        title: `${name} is turned off`,
-        lead: ["It's still in the registry, but ", code("enabled = false"), " keeps TensorWatch from running it."],
-        acts: [B(["Copy ", code(`tensorwatch enable ${name}`)], () => copy(`tensorwatch enable ${name}`), { iconName: "copy", primary: true, act: "copy-enable" }),
+        title: `${title} is turned off`,
+        lead: ["It's still in the registry", board.remote ? ` on ${board.machine}` : "", ", but ", code("enabled = false"), " keeps TensorWatch from running it."],
+        acts: [B(["Copy ", code(`tensorwatch enable ${board.short}`)], () => copy(`tensorwatch enable ${board.short}`), { iconName: "copy", primary: true, act: "copy-enable" }),
           B("Remove board", () => removeBoard(name), { iconName: "trash" })],
       });
     default:
       return page({
-        title: isAsleep(board) ? `${name} is asleep` : `${name} is stopped`,
+        title: isAsleep(board) ? `${title} is asleep` : `${title} is stopped`,
         lead: board.autostart === "on_demand"
           ? `It runs on demand: it starts while you have it open and sleeps ${dur(board.idle_timeout)} after you leave.`
           : board.autostart === "always"
@@ -1389,6 +1605,79 @@ function statusPage(board) {
         extra: board.message && !/^stopped/.test(board.message) ? logbox() : null,
       });
   }
+}
+
+/* remote machines */
+
+/** What to do about each way a connection fails. */
+function remoteAdvice(link) {
+  const ssh = code(`ssh ${link.ssh}`);
+  switch (link.error?.kind) {
+    case "auth":
+      return ["TensorWatch logs in with ", ssh, " and never asks for a password, so that has to work with a key or an agent."];
+    case "host_key":
+      return ["Run ", ssh, " once in a terminal to check and accept its host key."];
+    case "missing":
+      return ["Install it there with ", code("tensorwatch install"), ", or say where it is with ",
+        code(`tensorwatch remote set ${link.name} --command /path/to/tensorwatch`), "."];
+    case "too_old":
+      return [`Update TensorWatch on ${link.label}, then restart it there with `, code("systemctl --user restart tensorwatch"), "."];
+    case "unreachable":
+      return ["TensorWatch connects with ", ssh, ". Check that the machine is on and that ", code(`ssh ${link.ssh} true`),
+        " works from here. It keeps trying on its own."];
+    default:
+      return ["TensorWatch keeps trying on its own; ", code(`tensorwatch remote check ${link.name}`), " shows each step."];
+  }
+}
+
+function remoteTitle(link) {
+  if (!link.enabled) return `${link.label} is turned off`;
+  if (link.state === "connecting") return `Connecting to ${link.label}…`;
+  if (link.state !== "error") return `${link.label} isn't connected`;
+  return {
+    auth: `Can't log in to ${link.label}`,
+    host_key: `${link.label}'s host key isn't trusted`,
+    missing: `TensorWatch isn't installed on ${link.label}`,
+    too_old: `${link.label} runs an older TensorWatch`,
+  }[link.error?.kind] || `Can't reach ${link.label}`;
+}
+
+function showRemotePage(link, board) {
+  statusLog = null;
+  const key = ["remote", link.name, board ? board.name : active, link.state, link.enabled, link.error?.kind,
+    link.error?.message, link.next_attempt].join("|");
+  if (viewKey === key) {
+    patchLive(els.view);
+    return;
+  }
+  viewKey = key;
+  rebuild(els.view, remotePage(link, board));
+}
+
+function remotePage(link, board) {
+  const failed = link.state === "error";
+  const words = remoteWords(link);
+  const retry = link.next_attempt ? [" · next try in ", until(link.next_attempt)] : [];
+  return h("div", { class: "status" },
+    h("div", { class: "eyebrow" }, h("span", { class: `pill ${failed ? "bad" : "warn"}`, text: words.text || "Offline" })),
+    h("h2", { text: remoteTitle(link) }),
+    h("p", { class: "lead" }, link.state === "connecting"
+      ? ["TensorWatch is connecting with ", code(`ssh ${link.ssh}`), board ? ` to show ${board.short}.` : "."]
+      : link.enabled ? remoteAdvice(link)
+        : ["Turn it back on with ", code(`tensorwatch remote set ${link.name} --enable`), "."]),
+    failed ? h("div", { class: "msg" }, icon("alert"), h("div", {}, link.error.message,
+      h("span", { class: "src" }, `ssh ${link.ssh}`, ...retry))) : null,
+    h("div", { class: "acts" },
+      link.enabled && link.state !== "connecting"
+        ? button("Try again", () => retryRemote(link.name), { iconName: "restart", primary: true, key: "Enter" }) : null,
+      button(["Copy ", code(`tensorwatch remote check ${link.name}`)], () => copy(`tensorwatch remote check ${link.name}`),
+        { iconName: "copy", act: "copy-check" }),
+      board ? button("Close", closeActive, { iconName: "close", key: "w" }) : null),
+    h("dl", { class: "facts" },
+      h("div", {}, h("dt", { text: "Machine" }), h("dd", { text: link.label })),
+      h("div", {}, h("dt", { text: "Connects with" }), h("dd", { text: `ssh ${link.ssh}` })),
+      board ? h("div", {}, h("dt", { text: "Board" }), h("dd", { text: board.short })) : null,
+      board ? h("div", {}, h("dt", { text: "Log directory" }), h("dd", { title: board.target, text: shortPath(board.target) })) : null));
 }
 
 /* overview */
@@ -1409,17 +1698,17 @@ function attentionWhy(board) {
  * each time; none of that changes the page, so none of it is in the key.
  */
 function overviewKey(board) {
-  const attention = board.state === "failed" || isCrashing(board);
-  return [board.name, shownState(board), stateWord(board), attention ? `${summary(board)}|${attentionWhy(board)}` : "",
+  const attention = reachable(board) && (board.state === "failed" || isCrashing(board));
+  return [board.name, rowState(board), stateWord(board), attention ? `${summary(board)}|${attentionWhy(board)}` : "",
     board.writing, board.autostart, Boolean(board.last_event), board.target, board.port,
     board.state === "running" ? board.since : null];
 }
 
 function showOverviewPage() {
   statusLog = null;
-  const snapshot = queue();
-  const key = JSON.stringify(["overview", state.boards.map(overviewKey), queueKey(snapshot), [...armed.keys()],
-  state.server.config_path, state.server.keep_warm]);
+  const key = JSON.stringify(["overview", state.boards.map(overviewKey), queuesKey(), [...armed.keys()],
+    state.remotes.map((link) => [link.name, link.label, link.state, link.enabled, link.error, link.hostname]),
+    state.server.config_path, state.server.keep_warm]);
   if (viewKey === key) {
     patchLive(els.view);
     return;
@@ -1430,84 +1719,92 @@ function showOverviewPage() {
 
 function overview() {
   const boards = state.boards;
-  if (!boards.length) {
+  if (!boards.length && !state.remotes.length) {
     return h("div", { class: "status" },
       h("h2", { text: "No boards yet" }),
       h("p", { class: "lead", text: "Register a TensorBoard log directory and TensorWatch keeps it running on its own port from then on." }),
       h("div", { class: "acts" }, button("Add a board", showAddBoard, { iconName: "plus", primary: true, key: "+" })));
   }
-  const running = boards.filter((b) => b.state === "running");
-  const receiving = boards.filter((b) => b.writing);
-  const failed = boards.filter((b) => b.state === "failed");
-  const crashing = boards.filter(isCrashing);
-  const snapshot = queue();
+  const live = boards.filter(reachable);
+  const running = live.filter((b) => b.state === "running");
+  const receiving = live.filter((b) => b.writing);
+  const failed = live.filter((b) => b.state === "failed");
+  const crashing = live.filter(isCrashing);
+  const lost = state.remotes.filter((link) => link.enabled && link.state === "error");
   const activity = activityByBoard();
-  const limit = snapshot && snapshot.effective_limit;
+  const online = queues.filter((group) => group.snapshot.connected);
+  const leases = online.reduce((sum, group) => sum + group.snapshot.active_leases, 0);
+  const limits = online.map((group) => group.snapshot.effective_limit);
+  const limit = limits.length && limits.every(Boolean) ? limits.reduce((a, b) => a + b, 0) : null;
+  const grouped = state.remotes.length > 0;
   const tile = (label, value, tone = "", small = "") =>
     h("div", { class: `tile ${tone}` }, h("dt", { text: label }),
       h("dd", {}, typeof value === "object" ? value : String(value), small ? h("small", { text: small }) : null));
-  const attentionTone = failed.length ? "bad" : crashing.length ? "warn" : "";
+  const attentionTone = failed.length || lost.length ? "bad" : crashing.length ? "warn" : "";
+
+  const lostCards = lost.map((link) => h("div", { class: "attn-card" },
+    h("span", { class: "dot failed", "aria-hidden": "true" }),
+    h("div", { class: "ttl" }, link.label, h("span", { text: REMOTE_PROBLEM[link.error?.kind] || "Not connected" })),
+    h("div", { class: "acts" },
+      h("button", { type: "button", class: "btn sm", dataset: { act: `retry:${link.name}` }, onclick: () => retryRemote(link.name) }, "Try again")),
+    h("div", { class: "why", title: link.error?.message || "", text: link.error?.message || "" })));
 
   const cards = [...failed, ...crashing].map((board) => {
     const why = attentionWhy(board);
     return h("div", { class: `attn-card${isCrashing(board) ? " warn" : ""}` },
       h("span", { class: `dot ${shownState(board)}`, "aria-hidden": "true" }),
-      h("div", { class: "ttl" }, board.name, h("span", { text: summary(board) })),
+      h("div", { class: "ttl" }, titleOf(board), h("span", { text: summary(board) })),
       h("div", { class: "acts" },
         h("button", { type: "button", class: "btn sm", dataset: { act: `details:${board.name}` }, onclick: () => select(board.name) }, "Details"),
         h("button", { type: "button", class: "btn sm", dataset: { act: `restart:${board.name}` }, onclick: () => act(board.name, "restart").then(() => say(`Restarting ${board.name}`)).catch(reportError) },
           board.state === "failed" ? "Try again" : "Restart now")),
       h("div", { class: "why", title: board.message, text: why }));
   });
+  cards.unshift(...lostCards);
 
-  const rows = boards.map((board) => {
-    const work = activity.get(board.name) || EMPTY_WORK;
-    const up = board.state === "running";
-    return h("tr", { class: "link", tabindex: "0", dataset: { board: board.name },
-      onclick: (event) => { if (!event.target.closest?.("button")) select(board.name); },
-      onkeydown: (event) => { if (event.key === "Enter" && event.target === event.currentTarget) select(board.name); },
-      oncontextmenu: (event) => { event.preventDefault(); openMenu(board.name, event.clientX, event.clientY, event.currentTarget); } },
-      h("td", { class: "nm" }, h("b", { text: board.name }), h("small", { title: board.target, text: board.target })),
-      h("td", {}, h("span", { class: `pill ${stateTone(board)}`, text: stateWord(board) })),
-      h("td", {}, board.writing
-        ? h("span", { class: "act" }, icon("wave"), liveField("event", board.name, since(board.last_event)), " ago")
-        : h("span", { class: "muted" }, board.last_event ? [liveField("event", board.name, since(board.last_event)), " ago"] : "Never")),
-      h("td", {}, work.running.length || work.queued.length
-        ? [work.running.length ? h("span", { class: "pill" }, icon("play"), `${work.running.length} running`) : null, " ",
-          work.queued.length ? h("span", { class: "pill soft", text: `${work.queued.length} queued` }) : null]
-        : h("span", { class: "muted", text: "–" })),
-      h("td", {}, h("span", { class: "mode", title: MODE_HINT[board.autostart] },
-        board.autostart === "on_demand" ? icon("moon") : null, MODE_WORD[board.autostart] || board.autostart)),
-      h("td", { class: "num dim c-up" }, up ? since(board.since) : "–"),
-      h("td", { class: "num" }, liveField("mem", board.name, h("span", { text: LIVE.mem(board) }))),
-      h("td", { class: "num dim c-cpu" }, liveField("cpu", board.name, h("span", { text: LIVE.cpu(board) }))),
-      h("td", { class: "num dim c-port", text: String(board.port) }),
-      h("td", { class: "rowacts" }, (() => {
-        const more = iconButton("more", `Actions for ${board.name}`, (event) => {
-          event.stopPropagation();
-          toggleMenu(board.name, more);
-        });
-        more.dataset.menu = board.name;
-        more.setAttribute("aria-haspopup", "menu");
-        return more;
-      })()));
-  });
+  const COLUMNS = 10;
+  const groupRow = (label, words) => h("tr", { class: "grp" }, h("th", { colspan: String(COLUMNS), scope: "colgroup" },
+    label, h("span", { class: `muted${words.tone ? ` ${words.tone}` : ""}`, text: words.text })));
+  const rows = [];
+  if (grouped && boards.some((board) => !board.remote)) {
+    rows.push(groupRow(localLabel(), { text: state.server.hostname || "", tone: "" }));
+  }
+  let machine;
+  for (const board of boards) {
+    if (grouped && board.remote && board.remote !== machine) {
+      machine = board.remote;
+      const link = remoteOf(board);
+      rows.push(groupRow(board.machine, link ? remoteWords(link) : { text: "", tone: "" }));
+    }
+    rows.push(boardTableRow(board, activity));
+  }
+  // A machine with nothing to list still gets its line, which says why.
+  for (const link of state.remotes) {
+    if (boards.some((board) => board.remote === link.name)) continue;
+    rows.push(groupRow(link.label, remoteWords(link)));
+    rows.push(h("tr", {}, h("td", { colspan: String(COLUMNS), class: "muted",
+      text: link.state === "connected" ? "No boards registered there." : remoteTitle(link) })));
+  }
+  const machines = 1 + state.remotes.length;
+  const where = grouped
+    ? `on ${machines} machines`
+    : `from ${state.server.config_path || "the registry"}`;
 
   return h("div", { class: "ov" },
     h("div", { class: "ov-head" },
       h("div", {}, h("h2", { text: "Overview" }),
-        h("div", { class: "sub", text: `${boards.length} board${boards.length === 1 ? "" : "s"} from ${state.server.config_path || "the registry"}` })),
+        h("div", { class: "sub", text: `${boards.length} board${boards.length === 1 ? "" : "s"} ${where}` })),
       h("span", { class: "grow" }),
       button("Reload registry", reloadRegistry, { iconName: "refresh" }),
       button("Add board", showAddBoard, { iconName: "plus", primary: true })),
     h("dl", { class: "tiles" },
       tile("Running", running.length, "", `of ${boards.length}`),
       tile("Receiving data", receiving.length, receiving.length ? "ok" : ""),
-      tile("Need attention", failed.length + crashing.length, attentionTone),
+      tile("Need attention", failed.length + crashing.length + lost.length, attentionTone),
       tile("Memory", liveField("memtotal", "", h("span", { text: fmtBytes(running.reduce((sum, b) => sum + (b.rss_bytes || 0), 0)) }))),
-      tile("Jobs running", snapshot && snapshot.connected ? snapshot.active_leases : "–", "",
-        snapshot ? (snapshot.connected ? (limit ? `of ${limit} slots` : "") : "mlq offline") : "no mlq"),
-      tile("Jobs waiting", snapshot ? snapshot.queued.length : "–")),
+      tile("Jobs running", online.length ? leases : "–", "",
+        queues.length ? (online.length ? (limit ? `of ${limit} slots` : "") : "mlq offline") : "no mlq"),
+      tile("Jobs waiting", queues.length ? queues.reduce((sum, group) => sum + group.snapshot.queued.length, 0) : "–")),
     cards.length ? h("div", { class: "attn" }, ...cards) : null,
     h("h3", { class: "sh" }, "Boards", h("span", { class: "note", text: "Same order as the sidebar · press 1–9 to open" })),
     h("div", { class: "tw" }, h("table", { class: "t" },
@@ -1516,8 +1813,11 @@ function overview() {
         h("th", { text: "Mode" }), h("th", { class: "num c-up", text: "Up for" }), h("th", { class: "num", text: "Memory" }),
         h("th", { class: "num c-cpu", text: "CPU" }), h("th", { class: "num c-port", text: "Port" }), h("th", { class: "rowacts" }))),
       h("tbody", {}, ...rows))),
-    snapshot ? h("h3", { class: "sh" }, "Queue", h("span", { class: "note", text: queueSummary(snapshot) })) : null,
-    snapshot ? queueTable() : null,
+    ...queues.flatMap((group) => [
+      h("h3", { class: "sh" }, queuesGrouped() ? `Queue · ${group.label}` : "Queue",
+        h("span", { class: "note", text: queueSummary(group.snapshot) })),
+      queueTable(group),
+    ]),
     h("p", { class: "legend" },
       kbd("Ctrl K"), " search everything   ", kbd("/"), " filter   ", kbd("1"), "–", kbd("9"), " open a board   ",
       kbd("g"), " overview   ", kbd("["), " sidebar   ", kbd("q"), " fold queue   ", kbd("⇧ Q"), " full queue   ",
@@ -1525,6 +1825,43 @@ function overview() {
       h("br"),
       `To save memory, only the last ${state.server.keep_warm || 2} boards you viewed stay loaded; closing one with `,
       kbd("w"), " unloads it right away."));
+}
+
+/** One board in the overview table. */
+function boardTableRow(board, activity) {
+  const work = activity.get(board.name) || EMPTY_WORK;
+  const up = board.state === "running" && reachable(board);
+  const state = rowState(board);
+  return h("tr", { class: "link", tabindex: "0", dataset: { board: board.name },
+    onclick: (event) => { if (!event.target.closest?.("button")) select(board.name); },
+    onkeydown: (event) => { if (event.key === "Enter" && event.target === event.currentTarget) select(board.name); },
+    oncontextmenu: (event) => { event.preventDefault(); openMenu(board.name, event.clientX, event.clientY, event.currentTarget); } },
+    h("td", { class: "nm" }, h("b", { text: board.short }), h("small", { title: board.target, text: board.target })),
+    h("td", {}, state === "offline"
+      ? h("span", { class: "pill soft", title: "Last known state", text: "Offline" })
+      : h("span", { class: `pill ${stateTone(board)}`, text: stateWord(board) })),
+    h("td", {}, board.writing && up
+      ? h("span", { class: "act" }, icon("wave"), liveField("event", board.name, since(board.last_event)), " ago")
+      : h("span", { class: "muted" }, board.last_event ? [liveField("event", board.name, since(board.last_event)), " ago"] : "Never")),
+    h("td", {}, work.running.length || work.queued.length
+      ? [work.running.length ? h("span", { class: "pill" }, icon("play"), `${work.running.length} running`) : null, " ",
+        work.queued.length ? h("span", { class: "pill soft", text: `${work.queued.length} queued` }) : null]
+      : h("span", { class: "muted", text: "–" })),
+    h("td", {}, h("span", { class: "mode", title: MODE_HINT[board.autostart] },
+      board.autostart === "on_demand" ? icon("moon") : null, MODE_WORD[board.autostart] || board.autostart)),
+    h("td", { class: "num dim c-up" }, up ? since(board.since) : "–"),
+    h("td", { class: "num" }, liveField("mem", board.name, h("span", { text: LIVE.mem(board) }))),
+    h("td", { class: "num dim c-cpu" }, liveField("cpu", board.name, h("span", { text: LIVE.cpu(board) }))),
+    h("td", { class: "num dim c-port", text: String(board.port) }),
+    h("td", { class: "rowacts" }, (() => {
+      const more = iconButton("more", `Actions for ${titleOf(board)}`, (event) => {
+        event.stopPropagation();
+        toggleMenu(board.name, more);
+      });
+      more.dataset.menu = board.name;
+      more.setAttribute("aria-haspopup", "menu");
+      return more;
+    })()));
 }
 
 /* -------------------------------------------------------------------- menu */
@@ -1557,12 +1894,12 @@ function openMenu(name, x, y, returnTo) {
     onclick: () => { closeMenu(true); setMode(name, value); } },
   h("span", { class: "check" }, board.autostart === value ? icon("check") : null), h("span", { class: "label", text: MODE_WORD[value] }));
   els.menu.replaceChildren(
-    h("div", { class: "lbl", role: "presentation", text: name }),
+    h("div", { class: "lbl", role: "presentation", text: titleOf(board) }),
     item("Open", "pane", () => select(name), { key: "Enter" }),
     item("Open in its own window", "external", () => detach(name), { key: "d" }),
     h("hr"),
     board.state !== "disabled" ? item(running ? "Stop" : "Start", running ? "stop" : "play", () => (running ? stopBoard(name) : startBoard(name))) : null,
-    item("Restart", "restart", () => act(name, "restart").then(() => say(`Restarting ${name}`)).catch(reportError)),
+    item("Restart", "restart", () => act(name, "restart").then(() => say(`Restarting ${titleOf(board)}`)).catch(reportError)),
     h("hr"),
     h("div", { class: "lbl", role: "presentation", text: "Mode" }),
     mode("always"), mode("on_demand"), mode("manual"),
@@ -1638,28 +1975,32 @@ function renderPalette() {
   // matches substrings, or a two-letter query would match everything.
   const hit = (text, fuzzy = false) => !q || q.split(/\s+/).every((word) =>
     text.toLowerCase().includes(word) || (fuzzy && subsequence(text.toLowerCase(), word)));
-  const boards = state.boards.filter((b) => hit(b.name, true) || hit(b.target)).map((b) => ({
-    group: "Boards", label: b.name, aside: stateWord(b), dot: shownState(b), board: b.name, run: () => select(b.name) }));
+  const boards = state.boards.filter((b) => hit(b.name, true) || hit(b.target) || (b.machine && hit(b.machine))).map((b) => ({
+    group: "Boards", label: b.short, aside: b.remote ? `${reachable(b) ? stateWord(b) : "Offline"} · ${b.machine}` : stateWord(b),
+    dot: rowState(b), board: b.name, run: () => select(b.name) }));
   const jobs = q ? allJobs().filter((job) => hit(`${job.name} #${job.id} ${job.project}`)).map((job) => ({
-    group: "Jobs", label: job.name, aside: `${job.state === "running" ? "running" : "waiting"} · ${job.board || job.project}`,
-    iconName: "queue", run: () => openJobBoard(job.id) })) : [];
+    group: "Jobs", label: job.name,
+    aside: `${job.state === "running" ? "running" : "waiting"} · ${job.board ? splitName(job.board)[0] : job.project}${job.remote ? ` · ${remoteNamed(job.remote)?.label || job.remote}` : ""}`,
+    iconName: "queue", run: () => openJobBoard(job.key) })) : [];
   const cur = active && byName(active);
   const up = cur && isOn(cur);
   const dark = currentTheme() === "dark";
   const actions = [
-    cur && { label: `Restart ${cur.name}`, iconName: "restart", run: () => act(cur.name, "restart").catch(reportError) },
-    cur && cur.state !== "disabled" && { label: `${up ? "Stop" : "Start"} ${cur.name}`, iconName: up ? "stop" : "play",
+    cur && { label: `Restart ${titleOf(cur)}`, iconName: "restart", run: () => act(cur.name, "restart").catch(reportError) },
+    cur && cur.state !== "disabled" && { label: `${up ? "Stop" : "Start"} ${titleOf(cur)}`, iconName: up ? "stop" : "play",
       run: () => (up ? stopBoard(cur.name) : startBoard(cur.name)) },
-    cur && { label: `View ${cur.name} log`, iconName: "log", aside: "l", run: () => showLogs(cur.name) },
+    cur && { label: `View ${titleOf(cur)} log`, iconName: "log", aside: "l", run: () => showLogs(cur.name) },
     ...(cur ? Object.keys(MODE_WORD).filter((m) => m !== cur.autostart).map((m) => ({
-      label: `Run ${cur.name} ${({ always: "always", on_demand: "on demand", manual: "only when started" })[m]}`,
+      label: `Run ${titleOf(cur)} ${({ always: "always", on_demand: "on demand", manual: "only when started" })[m]}`,
       iconName: "moon", run: () => setMode(cur.name, m) })) : []),
-    cur && { label: `Close ${cur.name}`, iconName: "close", aside: "w", run: closeActive },
-    cur && { label: `Remove ${cur.name}`, iconName: "trash", run: () => removeBoard(cur.name) },
-    ...state.boards.filter((b) => (b.state === "failed" || isCrashing(b)) && b !== cur).map((b) => ({
-      label: `Restart ${b.name}`, iconName: "restart", aside: stateWord(b), run: () => act(b.name, "restart").catch(reportError) })),
+    cur && { label: `Close ${titleOf(cur)}`, iconName: "close", aside: "w", run: closeActive },
+    cur && { label: `Remove ${titleOf(cur)}`, iconName: "trash", run: () => removeBoard(cur.name) },
+    ...state.boards.filter((b) => reachable(b) && (b.state === "failed" || isCrashing(b)) && b !== cur).map((b) => ({
+      label: `Restart ${titleOf(b)}`, iconName: "restart", aside: stateWord(b), run: () => act(b.name, "restart").catch(reportError) })),
+    ...state.remotes.filter((link) => link.enabled && link.state === "error").map((link) => ({
+      label: `Reconnect to ${link.label}`, iconName: "refresh", aside: REMOTE_PROBLEM[link.error?.kind] || "", run: () => retryRemote(link.name) })),
     { label: "Go to overview", iconName: "home", aside: "g", run: showOverview },
-    queue() && { label: queueExpanded ? "Show compact queue" : "Show full queue", iconName: "queue", aside: "⇧ Q", run: () => toggleQueueExpanded() },
+    queues.length > 0 && { label: queueExpanded ? "Show compact queue" : "Show full queue", iconName: "queue", aside: "⇧ Q", run: () => toggleQueueExpanded() },
     { label: "Add a board…", iconName: "plus", aside: "+", run: showAddBoard },
     { label: "Reload registry", iconName: "refresh", aside: "r", run: reloadRegistry },
     { label: "Show or hide the sidebar", iconName: "side", aside: "[", run: toggleRail },
@@ -1774,7 +2115,7 @@ async function showLogs(name) {
   logsFor = name;
   logsText = "";
   els.logsCopy.disabled = true;
-  els.logsTitle.textContent = `${name} log`;
+  els.logsTitle.textContent = `${board ? titleOf(board) : name} log`;
   els.logsPath.textContent = board ? board.log_path : "";
   els.logsBody.textContent = "Loading…";
   els.logs.inert = false;
@@ -1812,6 +2153,8 @@ function closeLogs() {
  */
 async function removeBoard(name) {
   const wasActive = active === name;
+  const board = byName(name);
+  const [, remote] = splitName(name);
   // Keep the keyboard in the list: the row about to go has the focus.
   const row = boardRows.get(name);
   if (row && document.activeElement === row.el) {
@@ -1819,14 +2162,15 @@ async function removeBoard(name) {
   }
   try {
     const { undo } = await request("DELETE", boardPath(name));
-    toast(`Removed ${name}`, {
+    toast(`Removed ${board ? titleOf(board) : name}`, {
       ttl: 12000,
       action: {
         label: "Undo",
         run: () =>
-          post("/api/boards", { undo })
+          post(`${apiBase(remote)}/api/boards`, { undo })
             .then((result) => {
-              if (wasActive && !active) openWhenKnown(result.board);
+              const restored = remote ? `${result.board}@${remote}` : result.board;
+              if (wasActive && !active) openWhenKnown(restored);
               say(`Restored ${result.board}`);
             })
             .catch(reportError),
@@ -2042,25 +2386,70 @@ function openWhenKnown(name) {
   else pendingSelect = name;
 }
 
+/** A machine's mlq snapshot with its jobs named the way this dashboard names boards. */
+function machineQueue(snapshot, remote) {
+  if (!remote) {
+    const own = (job) => ({ ...job, key: String(job.id), remote: null });
+    return { ...snapshot, running: snapshot.running.map(own), queued: snapshot.queued.map(own) };
+  }
+  const named = (board) => `${board}@${remote}`;
+  const theirs = (job) => ({
+    ...job, key: `${job.id}@${remote}`, remote,
+    board: job.board ? named(job.board) : job.board, boards: (job.boards || []).map(named),
+  });
+  return { ...snapshot, running: snapshot.running.map(theirs), queued: snapshot.queued.map(theirs) };
+}
+
+/** Merge this machine's state and each remote's into the one list the dashboard shows. */
+function flatten(payload) {
+  const remotes = payload.remotes || [];
+  const boards = payload.boards.map((board) => ({ ...board, short: board.name, remote: null, machine: null }));
+  const groups = payload.queue ? [{ machine: "", label: localLabel(), snapshot: machineQueue(payload.queue, null), base: "" }] : [];
+  for (const link of remotes) {
+    for (const board of link.boards || []) {
+      boards.push({ ...board, name: `${board.name}@${link.name}`, short: board.name, remote: link.name, machine: link.label });
+    }
+    if (link.queue) {
+      const snapshot = machineQueue(link.queue, link.name);
+      // A link that is down cannot cancel anything: its queue reads as offline.
+      groups.push({
+        machine: link.name, label: link.label, base: apiBase(link.name),
+        snapshot: link.state === "connected" ? snapshot
+          : { ...snapshot, connected: false, error: `${link.label} is not connected.` },
+      });
+    }
+  }
+  return { state: { ...payload, remotes, boards, queue: groups[0]?.snapshot ?? null }, groups };
+}
+
 function absorb(payload) {
-  state = payload;
+  const merged = flatten(payload);
+  state = merged.state;
+  queues = merged.groups;
   boardIndex = new Map(state.boards.map((board) => [board.name, board]));
+  remoteIndex = new Map(state.remotes.map((link) => [link.name, link]));
   streamDown = false;
   if (pendingSelect && byName(pendingSelect)) {
     const name = pendingSelect;
     pendingSelect = null;
     select(name);
   }
-  if (active && !byName(active)) {
+  // A remote board stays selected while its machine is still connecting.
+  const waiting = (name) => {
+    const link = remoteNamed(splitName(name)[1]);
+    return Boolean(link && link.state !== "connected" && link.enabled);
+  };
+  if (active && !byName(active) && !waiting(active)) {
     active = null;
     localStorage.removeItem(ACTIVE_KEY);
   }
   if (menuFor && !byName(menuFor)) closeMenu();
   for (const name of [...frames.keys()]) {
     const board = byName(name);
-    // A dead board's iframe would show a browser error page and hold its heap.
-    if (!board) unmount(name);
-    else if (board.state !== "running") unmount(name, { keepActive: true });
+    // A dead board's iframe would show a browser error page and hold its heap;
+    // so would one whose machine went away.
+    if (!board) unmount(name, { keepActive: waiting(name) });
+    else if (board.state !== "running" || !reachable(board)) unmount(name, { keepActive: true });
   }
   scheduleHeartbeat();
   schedule();
@@ -2089,7 +2478,7 @@ if (typeof window !== "undefined") {
 /** Renew watched boards well before their idle lease expires. */
 function scheduleHeartbeat(force = false) {
   const names = [...new Set([...lru, ...(active ? [active] : [])])]
-    .filter((name) => byName(name) && !isStoppedByUser(byName(name)));
+    .filter((name) => byName(name) && reachable(byName(name)) && !isStoppedByUser(byName(name)));
   const watched = names.map(byName);
   const key = document.hidden ? "" : JSON.stringify(
     watched.map((board) => [board.name, board.autostart, board.idle_timeout]),
@@ -2243,7 +2632,7 @@ document.addEventListener("keydown", (event) => {
     g: showOverview,
     "[": toggleRail,
     q: () => els.queueHead.click(),
-    Q: () => queue() && toggleQueueExpanded(),
+    Q: () => queues.length > 0 && toggleQueueExpanded(),
     r: reloadRegistry,
   }[event.key];
   if (global) {

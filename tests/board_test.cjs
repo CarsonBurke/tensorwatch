@@ -11,7 +11,7 @@ const source = fs.readFileSync(path.join(__dirname, "../src/tensorwatch/web/boar
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 /** Load board.js for `/boards/<name>` against a fake DOM, timers and fetch. */
-async function load(name = "cleanrl", boards = [], { hidden = false } = {}) {
+async function load(name = "cleanrl", boards = [], { hidden = false, remotes = [] } = {}) {
   const elements = new Map();
   const element = (id) => {
     if (!elements.has(id)) {
@@ -28,6 +28,8 @@ async function load(name = "cleanrl", boards = [], { hidden = false } = {}) {
   };
   const page = {
     boards,
+    remotes,
+    urls: [],
     server: { idle_exit: 120 },
     down: false,
     posts: [],
@@ -49,16 +51,17 @@ async function load(name = "cleanrl", boards = [], { hidden = false } = {}) {
   page.document = document;
   const context = {
     document,
-    location: { pathname: `/boards/${encodeURIComponent(name)}` },
+    location: { pathname: `/boards/${encodeURIComponent(name)}`, protocol: "http:", port: "7005" },
     window: { addEventListener: (event, callback) => page.winListeners.set(event, callback) },
     fetch: (url, options = {}) => {
       if (url === "/api/state") {
         page.polls += 1;
         if (page.down) return Promise.reject(new Error("connection refused"));
-        const body = JSON.parse(JSON.stringify({ boards: page.boards, server: page.server }));
+        const body = JSON.parse(JSON.stringify({ boards: page.boards, remotes: page.remotes, server: page.server }));
         return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
       }
       page.posts.push(url.split("/").pop());
+      page.urls.push(url);
       assert.equal(options.method, "POST");
       return Promise.resolve({ ok: true });
     },
@@ -88,7 +91,7 @@ async function load(name = "cleanrl", boards = [], { hidden = false } = {}) {
 }
 
 const board = (fields) => ({
-  name: "cleanrl", url: "http://127.0.0.1:6100/", autostart: "on_demand",
+  name: "cleanrl", host: "cleanrl", url: "http://127.0.0.1:6100/", autostart: "on_demand",
   idle_timeout: 900, state: "stopped", message: "", ...fields,
 });
 
@@ -102,7 +105,8 @@ test("opening a sleeping on-demand board wakes it and keeps its lease", async ()
   page.boards = [board({ state: "running" })];
   await page.tick();
   assert.equal(page.appended.length, 1);
-  assert.equal(page.appended[0].src, "http://127.0.0.1:6100/");
+  // Its own origin on the port this page came through, which a tunnel may have moved.
+  assert.equal(page.appended[0].src, "http://cleanrl.localhost:7005/");
   assert.equal(page.element("solo-status").hidden, true);
   // Serving: poll only as often as presence needs, well inside the idle grace.
   assert.equal(page.pollTimer()[1].ms, 10000);
@@ -177,4 +181,35 @@ test("leaving the page stops polling, and coming back resumes it", async () => {
   await flush();
   assert.equal(page.polls, polls + 1);
   assert.ok(page.pollTimer());
+});
+
+const link = (fields) => ({
+  name: "gpu", label: "GPU box", ssh: "gpu", state: "connected", error: null, boards: [], ...fields,
+});
+
+test("another machine's board is shown and driven through its link", async () => {
+  const remotes = [link({ boards: [board({ host: "clean-rl" })] })];
+  const page = await load("cleanrl@gpu", [board({ name: "local" })], { remotes });
+  assert.equal(page.document.title, "cleanrl on gpu · TensorWatch");
+  assert.deepEqual(page.urls, ["/api/remotes/gpu/api/boards/cleanrl/demand", "/api/remotes/gpu/api/boards/cleanrl/renew"]);
+  page.remotes = [link({ boards: [board({ host: "clean-rl", state: "running" })] })];
+  await page.tick();
+  assert.equal(page.appended[0].src, "http://clean-rl.gpu.localhost:7005/");
+});
+
+test("a remote board waits for its machine, then is asked for again", async () => {
+  const remotes = [link({ state: "error", error: { kind: "unreachable", message: "No route to host" } })];
+  const page = await load("cleanrl@gpu", [], { remotes });
+  assert.deepEqual(page.posts, []);
+  assert.match(page.element("solo-title").textContent, /Can't reach GPU box/);
+  assert.match(page.element("solo-message").textContent, /No route to host/);
+  page.remotes = [link({ boards: [board({})] })];
+  await page.tick();
+  assert.deepEqual(page.posts, ["demand", "renew"]);
+});
+
+test("an unknown remote says so", async () => {
+  const page = await load("cleanrl@nowhere", [board({})]);
+  assert.match(page.element("solo-title").textContent, /No remote named nowhere/);
+  assert.deepEqual(page.posts, []);
 });

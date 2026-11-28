@@ -1,9 +1,10 @@
-"""Control-plane HTTP server: dashboard assets plus a small JSON/SSE API.
+"""The dashboard port: dashboard assets, a small JSON/SSE API, and the boards.
 
-Board traffic is deliberately *not* proxied through this server.  TensorBoard
-ships multi-megabyte JSON payloads; putting Python in that path would add a copy
-and a bottleneck for every scalar fetch.  Instead the dashboard iframes each
-board on its own loopback port and this server only carries status.
+What a request is for depends on its Host header. The loopback names
+(``127.0.0.1``, ``localhost``, ``[::1]``) reach the dashboard and its API; a
+board's own name (``cleanrl.localhost``, or ``cleanrl.nvidia-desktop.localhost``
+for a remote one) reaches that board, relayed by :mod:`tensorwatch.proxy`. The
+two never mix: a board's page, whatever it contains, cannot call the API.
 """
 
 from __future__ import annotations
@@ -20,14 +21,18 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
-from .config import AUTOSTART_MODES
+from . import proxy
+from .config import AUTOSTART_MODES, BoardSpec
 from .queue import QueueError
 from .supervisor import Supervisor
 
 WEB_ROOT = Path(__file__).parent / "web"
 #: SSE keep-alive comment cadence; also bounds how fast a closed tab is noticed.
 SSE_HEARTBEAT = 20.0
-_ALLOWED_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+#: Marks a request that keeps this manager up but is not a window here: from
+#: another TensorWatch that shows this one's boards, or from the CLI (see
+#: ``Supervisor.touch``). Only windows make a manager connect to its remotes.
+PEER_HEADER = "X-TensorWatch-Peer"
 #: The control API is unauthenticated, so the dashboard must not be framable:
 #: otherwise a page elsewhere can overlay it and harvest clicks on start/stop,
 #: which arrive with a legitimate same-origin Origin.
@@ -37,6 +42,25 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
 }
+
+#: Dashboard requests carry small JSON; anything bigger is refused unread.
+API_BODY_LIMIT = 1024 * 1024
+
+
+def board_framing(port: int | None) -> tuple[str, str]:
+    """The policy added to every board response: only the dashboard on this
+    port (or the board itself, for TensorBoard's plugin frames) may frame it.
+
+    The port is the one the browser used, which a tunnel may have changed.
+    Sent as a second policy, so the board's own still applies in full. CSP
+    cannot name IPv6 literals, so a dashboard opened at ``[::1]`` cannot frame
+    boards; the CLI and launcher open ``127.0.0.1``.
+    """
+    where = f":{port}" if port else ""
+    return (
+        "Content-Security-Policy",
+        f"frame-ancestors 'self' http://localhost{where} http://127.0.0.1{where}",
+    )
 
 
 class ControlServer(ThreadingHTTPServer):
@@ -56,8 +80,13 @@ class ControlServer(ThreadingHTTPServer):
         on_complete: Callable[[str], Any] | None = None,
         on_suggest: Callable[[], Any] | None = None,
         sock: socket.socket | None = None,
+        federation: Any = None,
     ) -> None:
         self.supervisor = supervisor
+        #: The remote links (:class:`tensorwatch.remote.Federation`), if any.
+        self.federation = federation
+        self._upstreams: dict[tuple[str, int], proxy.Upstream] = {}
+        self._upstreams_lock = threading.Lock()
         self.on_reload = on_reload
         self.on_cancel = on_cancel
         self.on_add = on_add
@@ -77,6 +106,27 @@ class ControlServer(ThreadingHTTPServer):
         self.socket = sock
         self.server_address = sock.getsockname()
 
+    def get_request(self):
+        conn, address = super().get_request()
+        # Responses go out as a header write and then body writes. Without
+        # NODELAY, Nagle holds back the second small write until the browser's
+        # delayed ACK (~40 ms) arrives, on every request. systemd's NoDelay=
+        # covers socket activation; this covers a server that binds its own.
+        if conn.family in (socket.AF_INET, socket.AF_INET6):
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return conn, address
+
+    def board_upstream(self, spec: BoardSpec) -> proxy.Upstream:
+        key = (spec.host, spec.port)
+        with self._upstreams_lock:
+            upstream = self._upstreams.get(key)
+            if upstream is None:
+                upstream = self._upstreams[key] = proxy.Upstream(address=key)
+            return upstream
+
+    def remote_link(self, name: str):
+        return self.federation.link(name) if self.federation is not None else None
+
     def handle_error(self, request, client_address) -> None:  # noqa: D102 - quiet resets
         import sys
         import traceback
@@ -91,6 +141,8 @@ class ControlHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "tensorwatch"
     sys_version = ""
+    #: Where the Host header points; set once the request is parsed.
+    route: proxy.Route | None = None
 
     # ------------------------------------------------------------------ helpers
 
@@ -137,12 +189,14 @@ class ControlHandler(BaseHTTPRequestHandler):
         The dashboard is unauthenticated, so a page in another tab must not be
         able to drive it: any browser-attached request carries Origin, and only
         our own origin is accepted.  A missing Host header is refused rather than
-        waved through - the check must fail closed.
+        waved through - the check must fail closed.  The Origin is compared with
+        the Host header rather than this server's port, so the dashboard also
+        works through ``ssh -L 7005:127.0.0.1:6005``.
+
+        A board origin is someone else's page as far as the API is concerned,
+        though it is on loopback too.
         """
-        raw_host = (self.headers.get("Host") or "").strip()
-        # `[::1]:6005` -> `[::1]`, `127.0.0.1:6005` -> `127.0.0.1`.
-        host = raw_host.split("]")[0] + "]" if raw_host.startswith("[") else raw_host.rsplit(":", 1)[0]
-        if host not in _ALLOWED_HOSTS:
+        if self.route is None or not self.route.dashboard:
             return False
         # A page elsewhere can still fire GETs without an Origin (an <img>, a
         # <script>); browsers label those, and nothing here is meant for them.
@@ -152,23 +206,54 @@ class ControlHandler(BaseHTTPRequestHandler):
         ) not in ("same-origin", "none"):
             return False
         origin = self.headers.get("Origin")
-        if origin:
-            parsed = urlparse(origin)
-            if parsed.hostname not in _ALLOWED_HOSTS:
-                return False
-            if parsed.port != self.server.server_address[1]:
-                return False
+        if origin and not proxy.same_origin(origin, self.headers.get("Host") or ""):
+            return False
+        self.supervisor.touch(peer=self._peer)
         return True
+
+    @property
+    def _peer(self) -> bool:
+        return bool(self.headers.get(PEER_HEADER))
 
     # ------------------------------------------------------------------- routing
 
     def parse_request(self) -> bool:
         ok = super().parse_request()
         if ok:
-            self.supervisor.touch()
+            self.route = proxy.classify(self.headers.get("Host"))
         return ok
 
-    def do_GET(self) -> None:
+    def _dispatch(self) -> None:
+        if self.route is not None and not self.route.dashboard:
+            return self._board()
+        if self.command in ("GET", "HEAD"):
+            # Nothing here reads a GET body; one that came anyway must not be
+            # parsed as the next request on this connection.
+            if proxy.has_body(self):
+                self.close_connection = True
+            return self._get()
+        if self.command == "POST":
+            return self._post()
+        if self.command == "DELETE":
+            return self._delete()
+        self.close_connection = True
+        return self._error(HTTPStatus.METHOD_NOT_ALLOWED, f"{self.command} not allowed")
+
+    def _api_body(self) -> bytes | None:
+        """The body of a request to the dashboard's API, checked before it is read.
+
+        Refusing first means a page elsewhere cannot make this server buffer
+        anything; the connection then closes with the body unread.
+        """
+        if not self._local_only():
+            self.close_connection = True
+            self._error(HTTPStatus.FORBIDDEN, "cross-origin request refused")
+            return None
+        return proxy.read_body(self, API_BODY_LIMIT)
+
+    do_GET = do_HEAD = do_POST = do_DELETE = do_PUT = do_PATCH = do_OPTIONS = _dispatch
+
+    def _get(self) -> None:
         if not self._local_only():
             return self._error(HTTPStatus.FORBIDDEN, "cross-origin request refused")
         parsed = urlparse(self.path)
@@ -195,6 +280,8 @@ class ControlHandler(BaseHTTPRequestHandler):
             return self._lookup("on_suggest", "suggestions")
 
         parts = path.strip("/").split("/")
+        if parts[:2] == ["api", "remotes"]:
+            return self._remote_api(parts, b"")
         if len(parts) == 4 and parts[:2] == ["api", "boards"] and parts[3] == "logs":
             try:
                 lines = int((parse_qs(parsed.query).get("lines") or ["200"])[0])
@@ -214,8 +301,6 @@ class ControlHandler(BaseHTTPRequestHandler):
             )
         return self._error(HTTPStatus.NOT_FOUND, "not found")
 
-    do_HEAD = do_GET
-
     def _lookup(self, hook_name: str, key: str, *args: str) -> None:
         """Answer a read-only question about the filesystem through a hook."""
         hook = getattr(self.server, hook_name)
@@ -226,14 +311,13 @@ class ControlHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
-    def do_DELETE(self) -> None:
-        # Drain any body, as do_POST does, so it is not read as the next request.
-        length = int(self.headers.get("Content-Length") or 0)
-        if length:
-            self.rfile.read(length)
-        if not self._local_only():
-            return self._error(HTTPStatus.FORBIDDEN, "cross-origin request refused")
+    def _delete(self) -> None:
+        raw = self._api_body()
+        if raw is None:
+            return
         parts = urlparse(self.path).path.strip("/").split("/")
+        if parts[:2] == ["api", "remotes"]:
+            return self._remote_api(parts, raw)
         if len(parts) != 3 or parts[:2] != ["api", "boards"]:
             return self._error(HTTPStatus.NOT_FOUND, "not found")
         name = unquote(parts[2])
@@ -248,14 +332,14 @@ class ControlHandler(BaseHTTPRequestHandler):
             return self._error(HTTPStatus.BAD_REQUEST, str(exc))
         return self._json({"ok": True, "board": name, **result})
 
-    def do_POST(self) -> None:
-        # Drain the body before any early return, or the unread bytes are parsed
-        # as the next request on this keep-alive connection.
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
-        if not self._local_only():
-            return self._error(HTTPStatus.FORBIDDEN, "cross-origin request refused")
+    def _post(self) -> None:
+        raw = self._api_body()
+        if raw is None:
+            return
         parts = urlparse(self.path).path.strip("/").split("/")
+
+        if parts[:2] == ["api", "remotes"]:
+            return self._remote_api(parts, raw)
 
         if parts == ["api", "reload"]:
             reload_hook = self.server.on_reload  # type: ignore[attr-defined]
@@ -371,6 +455,93 @@ class ControlHandler(BaseHTTPRequestHandler):
             return self._error(HTTPStatus.BAD_REQUEST, str(exc))
         return self._json(result)
 
+    # ------------------------------------------------------------------- boards
+
+    def _board(self) -> None:
+        """Relay a request on a board's origin to that board."""
+        raw_host = self.headers.get("Host") or ""
+        if not proxy.board_request_allowed(self.command, self.headers, raw_host):
+            self.close_connection = True
+            return proxy.send_text(self, HTTPStatus.FORBIDDEN, "cross-origin request refused")
+        if not self.path.startswith("/"):
+            self.close_connection = True
+            return proxy.send_text(self, HTTPStatus.BAD_REQUEST, "expected a path")
+        # Read before anything else can answer: an unread body would be parsed
+        # as the next request on this connection, a request no check has seen.
+        body = proxy.read_body(self)
+        if body is None:
+            return
+        route = self.route
+        assert route is not None
+        rewrite = None
+        if route.remote is None:
+            spec = self.supervisor.config.by_label.get(route.label)
+            if spec is None:
+                return self._board_error(HTTPStatus.NOT_FOUND, f"No board is registered as {raw_host}.")
+            upstream: proxy.Upstream | None = self.server.board_upstream(spec)  # type: ignore[attr-defined]
+            # The peer marker is for this manager; the board never sees it.
+            headers = proxy.forward_headers(self.headers.items(), drop=frozenset({PEER_HEADER.lower()}))
+            where = f"{spec.name} is not answering on port {spec.port}"
+        else:
+            link = self.server.remote_link(route.remote)  # type: ignore[attr-defined]
+            if link is None:
+                return self._board_error(HTTPStatus.NOT_FOUND, f"No remote is registered as {route.remote!r}.")
+            upstream = link.upstream
+            if upstream is None:
+                return self._board_error(HTTPStatus.SERVICE_UNAVAILABLE, link.unavailable())
+            inner = f"{route.label}.localhost"
+            headers = proxy.forward_headers(
+                self.headers.items(),
+                drop=proxy.BROWSER_CONTEXT,
+                set_={"Host": inner, PEER_HEADER: "1"},
+            )
+            rewrite = _location_rewriter(inner, raw_host)
+            where = f"{link.spec.title} did not answer"
+        # The manager the browser talks to says who may frame the board. One
+        # relaying for a peer leaves that to the peer: it knows the browser's
+        # port, and browsers enforce every policy, so a second would block it.
+        # A navigation cannot carry the peer header, so no page can drop it.
+        host = proxy.split_host(raw_host)
+        append = () if self._peer else (board_framing(host and host[1]),)
+        try:
+            proxy.relay(self, upstream, path=self.path, headers=headers, body=body,
+                        rewrite_location=rewrite, append=append)
+        except proxy.UpstreamError as exc:
+            return self._board_error(HTTPStatus.BAD_GATEWAY, f"{where} ({exc}).")
+
+    def _board_error(self, status: HTTPStatus, message: str) -> None:
+        return proxy.send_text(self, status, message, html=True)
+
+    def _remote_api(self, parts: list[str], body: bytes) -> None:
+        """``/api/remotes/<name>/api/...`` is that remote's own API, through its link."""
+        if len(parts) < 3:
+            return self._error(HTTPStatus.NOT_FOUND, "not found")
+        name = unquote(parts[2])
+        link = self.server.remote_link(name)  # type: ignore[attr-defined]
+        if link is None:
+            return self._error(HTTPStatus.NOT_FOUND, f"no remote {name!r}")
+        if parts[3:] == ["retry"] and self.command == "POST":
+            link.retry()
+            return self._json({"ok": True, "remote": name})
+        # Board origins, not this API, carry board traffic; and the remote's
+        # stream reaches the dashboard merged into this manager's own.
+        if parts[3:4] != ["api"] or parts[4:5] == ["events"] or len(parts) < 5:
+            return self._error(HTTPStatus.NOT_FOUND, "not found")
+        upstream = link.upstream
+        if upstream is None:
+            return self._error(HTTPStatus.SERVICE_UNAVAILABLE, link.unavailable())
+        query = urlparse(self.path).query
+        path = "/" + "/".join(parts[3:]) + (f"?{query}" if query else "")
+        headers = proxy.forward_headers(
+            self.headers.items(),
+            drop=proxy.BROWSER_CONTEXT | {"cookie"},
+            set_={"Host": "localhost", PEER_HEADER: "1"},
+        )
+        try:
+            proxy.relay(self, upstream, path=path, headers=headers, body=body)
+        except proxy.UpstreamError as exc:
+            return self._error(HTTPStatus.BAD_GATEWAY, f"{link.spec.title} did not answer ({exc})")
+
     # -------------------------------------------------------------------- static
 
     def _static(self, relative: str) -> None:
@@ -398,7 +569,7 @@ class ControlHandler(BaseHTTPRequestHandler):
     # ----------------------------------------------------------------------- sse
 
     def _events(self) -> None:
-        channel = self.supervisor.subscribe()
+        channel = self.supervisor.subscribe(peer=self._peer)
         try:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream")
@@ -440,6 +611,7 @@ def serve(
     on_complete: Callable[[str], Any] | None = None,
     on_suggest: Callable[[], Any] | None = None,
     sock: socket.socket | None = None,
+    federation: Any = None,
 ) -> ControlServer:
     """Start the control server on a background thread and return it.
 
@@ -448,8 +620,24 @@ def serve(
     """
     server = ControlServer(
         (host, port), supervisor, on_reload, on_cancel, on_add, on_autostart,
-        on_remove, on_restore, on_complete, on_suggest, sock,
+        on_remove, on_restore, on_complete, on_suggest, sock, federation,
     )
     thread = threading.Thread(target=server.serve_forever, name="tensorwatch-httpd", daemon=True)
     thread.start()
     return server
+
+
+def _location_rewriter(inner: str, outer: str) -> Callable[[str], str]:
+    """Map a remote board's redirects from its own host name to the one used here."""
+
+    def rewrite(location: str) -> str:
+        try:
+            parsed = urlparse(location)
+            hostname = parsed.hostname
+        except ValueError:  # a malformed URL is the browser's problem, as it was sent
+            return location
+        if hostname and hostname.lower() == inner:
+            return parsed._replace(netloc=outer).geturl()
+        return location
+
+    return rewrite

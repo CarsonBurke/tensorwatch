@@ -9,6 +9,9 @@
  * HTTP/1.1 connections per host across all windows, so one held stream per
  * pop-out would stall every request after the fifth. Each poll counts as
  * presence, and the page renews the board's on-demand lease like an open pane.
+ *
+ * `/boards/NAME@REMOTE` is a board on another machine: its state comes from
+ * that machine's link in the same payload, and its controls go through it.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -19,8 +22,12 @@ const els = {
   message: $("solo-message"),
   start: $("solo-start"),
 };
-const name = decodeURIComponent(location.pathname.replace(/\/+$/, "").split("/").pop() || "");
-document.title = `${name} · TensorWatch`;
+const key = decodeURIComponent(location.pathname.replace(/\/+$/, "").split("/").pop() || "");
+const at = key.lastIndexOf("@");
+const name = at > 0 ? key.slice(0, at) : key;
+const remote = at > 0 ? key.slice(at + 1) : null;
+const base = remote ? `/api/remotes/${encodeURIComponent(remote)}` : "";
+document.title = `${remote ? `${name} on ${remote}` : name} · TensorWatch`;
 
 /** Poll this often while the board is coming up, to show it the moment it serves. */
 const FAST_POLL_MS = 1000;
@@ -36,9 +43,17 @@ let inflight = false;
 let stopped = false;
 let heartbeat = null;
 let idleExit = null;
+/** The remote's link while this is another machine's board. */
+let link = null;
 
 const act = (action) =>
-  fetch(`/api/boards/${encodeURIComponent(name)}/${action}`, { method: "POST" }).catch(() => {});
+  fetch(`${base}/api/boards/${encodeURIComponent(name)}/${action}`, { method: "POST" }).catch(() => {});
+
+/** The board's own origin, on whatever port this page was reached through. */
+function boardURL(b) {
+  const host = remote ? `${b.host}.${remote}` : b.host;
+  return `${location.protocol}//${host}.localhost${location.port ? `:${location.port}` : ""}/`;
+}
 
 const stoppedByUser = (b) => b.state === "stopped" && b.message === "stopped on request";
 
@@ -67,15 +82,24 @@ function show(title, message, { canStart = false } = {}) {
 }
 
 function render() {
+  if (remote && !link) {
+    show(`No remote named ${remote}`, "It may have been removed with `tensorwatch remote rm`.");
+    return;
+  }
+  if (link && link.state !== "connected") {
+    const problem = link.error ? link.error.message : "";
+    if (link.state === "error") return show(`Can't reach ${link.label}`, `${problem} TensorWatch keeps trying.`);
+    return show(`Connecting to ${link.label}…`, `TensorWatch connects with ssh ${link.ssh}.`);
+  }
   if (!board) {
-    show(`No board named ${name}`, "It may have been removed from the registry.");
+    show(`No board named ${name}${link ? ` on ${link.label}` : ""}`, "It may have been removed from the registry.");
     return;
   }
   if (board.state === "running") {
     if (!frame) {
       frame = document.createElement("iframe");
       frame.className = "pane";
-      frame.src = board.url;
+      frame.src = boardURL(board);
       frame.title = `TensorBoard: ${name}`;
       frame.setAttribute("referrerpolicy", "no-referrer");
       document.body.append(frame);
@@ -116,7 +140,15 @@ function scheduleHeartbeat() {
 
 function absorb(payload) {
   const previous = board;
-  board = payload.boards.find((b) => b.name === name) || null;
+  if (remote) {
+    link = (payload.remotes || []).find((r) => r.name === remote) || null;
+    const up = link && link.state === "connected";
+    board = up ? (link.boards || []).find((b) => b.name === name) || null : null;
+    // A link that dropped comes back to a machine that may have restarted.
+    if (!up) woken = false;
+  } else {
+    board = payload.boards.find((b) => b.name === name) || null;
+  }
   idleExit = payload.server?.idle_exit ?? null;
   if (board && !woken) {
     // Opening the window is the request to see the board, and so is coming back

@@ -36,19 +36,27 @@ function fakeElement(tag = "div") {
     append(...nodes) {
       for (const node of nodes) {
         if (typeof node === "string") continue;
+        node.remove?.();  // like the DOM, a node lives in one place
         node.parent = el;
         el.children.push(node);
       }
     },
     appendChild: (node) => el.append(node),
-    insertBefore: (node) => el.append(node),
+    insertBefore(node, before) {
+      node.remove?.();
+      const at = before ? el.children.indexOf(before) : -1;
+      node.parent = el;
+      if (at < 0) el.children.push(node);
+      else el.children.splice(at, 0, node);
+    },
     replaceChildren(...nodes) {
       el.children.length = 0;
       el.append(...nodes);
     },
     remove() {
       if (!el.parent) return;
-      el.parent.children.splice(el.parent.children.indexOf(el), 1);
+      const at = el.parent.children.indexOf(el);
+      if (at >= 0) el.parent.children.splice(at, 1);
       el.parent = null;
     },
     get firstElementChild() { return el.children[0]; },
@@ -84,6 +92,7 @@ function dashboard(selected = "short", routes = () => undefined) {
   };
   const context = vm.createContext({
     document,
+    location: { protocol: "http:", port: "6005" },
     localStorage: { getItem: () => selected, setItem() {}, removeItem() {} },
     requestAnimationFrame() {},
     setInterval() {},
@@ -492,9 +501,9 @@ const job = (id, fields) => ({ id, name: `job${id}`, state: "queued", boards: []
 test("every icon drawn in the sidebar and overview exists", () => {
   const app = dashboard("short");
   app.update([board("short", 60), { ...board("idle", 60), state: "stopped" },
-    { ...board("bad", 60, "always"), state: "backoff", last_exit: 1, restarts: 2, message: "exited with code 1; retrying in 4s" }]);
-  app.run(`state.queue = ${JSON.stringify(queueOf([job(1, { state: "running", boards: ["short"] })], [job(2, { state: "held" })]))};
-    render(); active = null; render()`);
+    { ...board("bad", 60, "always"), state: "backoff", last_exit: 1, restarts: 2, message: "exited with code 1; retrying in 4s" }],
+  { queue: queueOf([job(1, { state: "running", boards: ["short"] })], [job(2, { state: "held" })]) });
+  app.run("render(); active = null; render()");
   const drawn = [];
   const walk = (node) => {
     if (node.tag === "path") drawn.push(node.attributes.d);
@@ -507,11 +516,14 @@ test("every icon drawn in the sidebar and overview exists", () => {
 
 test("the sidebar queue lists running jobs, then the open board's, then others up to the limit", () => {
   const app = dashboard("mine");
-  app.update([board("mine", 60, "always"), board("other", 60, "always")]);
-  app.run(`state.server.queue_visible = 4; state.queue = ${JSON.stringify(queueOf(
-    [job(1, { state: "running", boards: ["other"] })],
-    [job(2, { boards: ["other"] }), job(3, { boards: ["other"] }), job(4, { boards: ["mine"] }), job(5, {})],
-  ))}; render()`);
+  app.update([board("mine", 60, "always"), board("other", 60, "always")], {
+    server: { keep_warm: 2, queue_visible: 4 },
+    queue: queueOf(
+      [job(1, { state: "running", boards: ["other"] })],
+      [job(2, { boards: ["other"] }), job(3, { boards: ["other"] }), job(4, { boards: ["mine"] }), job(5, {})],
+    ),
+  });
+  app.run("render()");
   const nodes = app.el("queue-jobs").children
     .map((node) => (node.find((child) => child.className === "jname") || node).textContent);
   assert.deepEqual(nodes, ["Running", "job1", "mine's jobs", "job4", "Other jobs", "job2", "job3"]);
@@ -555,14 +567,13 @@ test("a queued job that starts needs a fresh confirmation to stop", () => {
 
 test("stopping a job takes a second click, and the first one wears off", async () => {
   const app = dashboard("", (method, url) => (url.startsWith("/api/queue/") ? { ok: true } : undefined));
-  app.update([]);
-  app.run(`state.queue = ${JSON.stringify(queueOf([job(7, { state: "running" })], []))}`);
-  app.run("cancelJob(7)");
+  app.update([], { queue: queueOf([job(7, { state: "running" })], []) });
+  app.run('cancelJob("7")');
   assert.equal(app.requests.filter(({ url }) => url.startsWith("/api/queue/")).length, 0);
   app.advance(3000);
-  app.run("cancelJob(7)");
+  app.run('cancelJob("7")');
   assert.equal(app.requests.filter(({ url }) => url.startsWith("/api/queue/")).length, 0);
-  app.run("cancelJob(7)");
+  app.run('cancelJob("7")');
   await settle();
   assert.deepEqual(app.requests.filter(({ url }) => url.startsWith("/api/queue/")).map(({ url }) => url),
     ["/api/queue/7/cancel"]);
@@ -694,8 +705,129 @@ test("a start timeout reads as a timeout, not as the SIGTERM that ended it", () 
 
 test("jobs without timestamps show a dash, not a nonsense age", () => {
   const app = dashboard("");
-  app.update([]);
-  app.run(`state.queue = ${JSON.stringify(queueOf([job(1, { state: "running", since: null })], [job(2, { queued_at: null })]))}`);
-  const text = app.run("queueTable()").text;
+  app.update([], { queue: queueOf([job(1, { state: "running", since: null })], [job(2, { queued_at: null })]) });
+  const text = app.run("queueTable(queues[0])").text;
   assert.doesNotMatch(text, /NaN|days/);
+});
+
+/* ------------------------------------------------------------------ remotes */
+
+const remote = (fields = {}) => ({
+  name: "gpu", label: "GPU box", ssh: "gpu", enabled: true, state: "connected", error: null,
+  next_attempt: null, hostname: "gpu-host", version: "0.2.0", latency_ms: 4, boards: [], queue: null, ...fields,
+});
+const remoteBoard = (name, fields = {}) => ({ ...board(name, 60, "always"), host: name, target: `/runs/${name}`, ...fields });
+const frameSources = (app) => app.el("panes").children.filter((node) => node.className === "pane").map((node) => node.src);
+
+test("boards are grouped by machine and each is framed at its own origin", () => {
+  const app = dashboard("cleanrl@gpu");
+  app.update([{ ...remoteBoard("local"), host: "local" }],
+    { remotes: [remote({ boards: [remoteBoard("cleanrl", { host: "clean-rl" })] })], server: { keep_warm: 2, hostname: "here" } });
+  app.run("render()");
+  const list = app.el("boards").children;
+  assert.deepEqual(list.map((node) => node.dataset.machine ?? node.dataset.name),
+    ["", "local", "gpu", "cleanrl@gpu"]);
+  assert.match(list[0].text, /This machinehere/);
+  assert.match(list[2].text, /GPU boxgpu-host/);
+  // The row shows the board's own name; the group says where it lives.
+  assert.match(list[3].text, /^cleanrl/);
+  assert.deepEqual(frameSources(app), ["http://clean-rl.gpu.localhost:6005/"]);
+});
+
+test("a remote board's controls go to its machine", async () => {
+  const app = dashboard("cleanrl@gpu", (method) => (method === "POST" ? { ok: true } : undefined));
+  app.update([], { remotes: [remote({ boards: [{ ...remoteBoard("cleanrl"), autostart: "on_demand" }] })] });
+  app.run('setMode("cleanrl@gpu", "manual"); act("cleanrl@gpu", "restart")');
+  await settle();
+  const urls = app.requests.map(({ url }) => url);
+  assert.ok(urls.includes("/api/remotes/gpu/api/boards/cleanrl/renew"), urls.join(" "));
+  assert.ok(urls.includes("/api/remotes/gpu/api/boards/cleanrl/autostart"));
+  assert.ok(urls.includes("/api/remotes/gpu/api/boards/cleanrl/restart"));
+  assert.ok(!urls.some((url) => url.startsWith("/api/boards/")));
+});
+
+test("a machine that can't be reached says why, offers a retry and frames nothing", async () => {
+  const app = dashboard("cleanrl@gpu", (method) => (method === "POST" ? { ok: true } : undefined));
+  const up = remote({ boards: [remoteBoard("cleanrl")] });
+  app.update([], { remotes: [up] });
+  app.run("render()");
+  assert.equal(frameSources(app).length, 1);
+
+  const down = { ...up, state: "error", error: { kind: "auth", message: "Permission denied (publickey)." }, next_attempt: Date.now() / 1000 + 60 };
+  const before = app.requests.length;
+  app.update([], { remotes: [down] });
+  app.run("render()");
+  // The last known boards stay listed, as offline; their panes are dropped.
+  assert.equal(frameSources(app).length, 0);
+  const [head, row] = app.el("boards").children;
+  assert.match(head.text, /SSH login refused/);
+  assert.match(row.className, /state-offline/);
+  assert.match(row.text, /Offline/);
+  const view = app.el("view").text;
+  assert.match(view, /Can't log in to GPU box/);
+  assert.match(view, /Permission denied \(publickey\)/);
+  assert.match(view, /key or an agent/);
+  // Nothing is renewed through a link that is down.
+  app.advance(120000);
+  assert.ok(!app.requests.slice(before).some(({ url }) => url.startsWith("/api/remotes/gpu/api/")));
+
+  head.find((node) => node.tag === "button").fire("click");
+  await settle();
+  assert.equal(app.requests.at(-1).url, "/api/remotes/gpu/retry");
+  assert.equal(app.requests.at(-1).method, "POST");
+});
+
+test("a remote board stays selected while its machine connects", () => {
+  const app = dashboard("cleanrl@gpu");
+  app.update([], { remotes: [remote({ state: "connecting", boards: [] })] });
+  app.run("render()");
+  assert.equal(app.run("active"), "cleanrl@gpu");
+  assert.match(app.el("view").text, /Connecting to GPU box/);
+  app.update([], { remotes: [remote({ boards: [remoteBoard("cleanrl")] })] });
+  app.run("render()");
+  assert.deepEqual(frameSources(app), ["http://cleanrl.gpu.localhost:6005/"]);
+  // Once connected, a board it no longer has is let go.
+  app.update([], { remotes: [remote({ boards: [] })] });
+  assert.equal(app.run("active"), null);
+});
+
+test("a window with no boards of its own shows another machine's", () => {
+  const app = dashboard("");
+  app.update([], { remotes: [remote({ boards: [remoteBoard("cleanrl")] })] });
+  app.run("render()");
+  assert.deepEqual(app.el("boards").children.map((node) => node.dataset.machine ?? node.dataset.name), ["gpu", "cleanrl@gpu"]);
+  assert.equal(app.el("boards-empty").hidden, true);
+  assert.match(app.el("view").text, /1 board on 2 machines/);
+});
+
+test("each machine's queue is listed under it, and cancelling goes to the right one", async () => {
+  const app = dashboard("", (method, url) => (url.includes("/queue/") ? { ok: true } : undefined));
+  app.update([remoteBoard("local")], {
+    queue: queueOf([job(7, { state: "running", boards: ["local"] })], []),
+    remotes: [remote({ boards: [remoteBoard("cleanrl")], queue: queueOf([job(7, { state: "running", boards: ["cleanrl"] })], [job(8, {})]) })],
+  });
+  app.run("toggleQueueExpanded(); render()");
+  const nodes = app.el("queue-jobs").children;
+  assert.deepEqual(nodes.map((node) => (node.className === "rq-machine"
+    ? `[${node.children[0].textContent}]`
+    : node.find((c) => c.className === "jname")?.textContent ?? node.textContent)),
+  ["[This machine]", "Running", "job7", "[GPU box]", "Running", "job7", "Waiting", "job8"]);
+  // Same job id on both machines: distinct rows, and the remote's goes to the remote.
+  assert.equal(app.run("jobRows.size"), 3);
+  app.run('cancelJob("7@gpu"); cancelJob("7@gpu")');
+  await settle();
+  assert.deepEqual(app.requests.filter(({ url }) => url.includes("/queue/")).map(({ url }) => url),
+    ["/api/remotes/gpu/api/queue/7/cancel"]);
+  // The remote job's board link opens the remote board.
+  assert.deepEqual(app.run('jobByKey("7@gpu").boards'), ["cleanrl@gpu"]);
+});
+
+test("a remote queue reads as offline while its link is down", () => {
+  const app = dashboard("");
+  app.update([], {
+    remotes: [remote({ state: "error", error: { kind: "unreachable", message: "timed out" }, queue: queueOf([job(1, { state: "running" })], []) })],
+  });
+  app.run("toggleQueueExpanded(); render()");
+  assert.match(app.el("queue-jobs").text, /GPU box: mlq isn't responding/);
+  assert.equal(app.run('queueOf(jobByKey("1@gpu")).snapshot.connected'), false);
 });

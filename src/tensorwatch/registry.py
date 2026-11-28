@@ -1,9 +1,9 @@
 """Comment-preserving edits of the TOML registry.
 
 ``tomllib`` reads TOML but cannot write it, and the registry is meant to be
-hand-edited, so edits are done as line surgery on ``[[board]]`` blocks: adding a
-board appends a block, removing one deletes exactly its lines, and setting a key
-rewrites (or inserts) a single line.  Everything the user typed elsewhere -
+hand-edited, so edits are done as line surgery on ``[[board]]`` (and
+``[[remote]]``) blocks: adding a board appends a block, removing one deletes
+exactly its lines, and setting a key rewrites (or inserts) a single line.  Everything the user typed elsewhere -
 comments, ordering, blank lines - survives.
 """
 
@@ -23,13 +23,17 @@ HEADER = """\
 # Edit by hand or with `tensorwatch add` / `tensorwatch rm` / `tensorwatch set`.
 #
 #   [[board]]
-#   name = "cleanrl"                 # url path + log file name
+#   name = "cleanrl"                 # board address + log file name
 #   logdir = "~/repos/cleanrl/runs"  # or logdir_spec = "a:/p/a,b:/p/b"
-#   port = 6100                      # stable; the dashboard links here directly
+#   port = 6100                      # stable; served at http://cleanrl.localhost:6005/
 #   autostart = "always"             # always | on_demand | manual
 #   reload_interval = 60             # seconds between event-file rescans
 #   samples_per_plugin = "scalars=2000,images=0"   # caps memory on huge runs
 #   args = ["--load_fast=true"]      # extra tensorboard flags
+#
+#   [[remote]]                       # another machine's TensorWatch, over SSH
+#   name = "gpu-box"                 # boards appear at <board>.gpu-box.localhost
+#   ssh = "gpu-box"                  # an ssh destination, e.g. a ~/.ssh/config Host
 
 [server]
 port = 6005
@@ -46,7 +50,7 @@ class RegistryError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Block:
-    """A ``[[board]]`` block located in the registry text."""
+    """A ``[[board]]`` (or other array-of-tables) block located in the registry text."""
 
     name: str
     data: Mapping[str, Any]
@@ -54,7 +58,7 @@ class Block:
     end: int  # exclusive, trailing blank lines and comments excluded
 
 
-def _ends_block(line: str) -> bool:
+def _ends_block(line: str, table: str = "board") -> bool:
     """True for a table header that starts something other than this board.
 
     ``[board.env]`` is a sub-table of the *current* ``[[board]]`` entry, so it
@@ -64,24 +68,24 @@ def _ends_block(line: str) -> bool:
     stripped = line.lstrip()
     if not stripped.startswith(_TABLE_START):
         return False
-    return not re.match(r"\[\s*board\s*\.", stripped)
+    return not re.match(rf"\[\s*{table}\s*\.", stripped)
 
 
-def _is_board_header(line: str) -> bool:
+def _is_header(line: str, table: str = "board") -> bool:
     stripped = line.strip().replace(" ", "")
-    return stripped.startswith("[[board]]")
+    return stripped.startswith(f"[[{table}]]")
 
 
-def blocks(text: str) -> list[Block]:
-    """Locate every ``[[board]]`` block, in file order."""
+def blocks(text: str, table: str = "board") -> list[Block]:
+    """Locate every ``[[table]]`` block, in file order."""
     lines = text.splitlines(keepends=True)
     found: list[Block] = []
     for index, line in enumerate(lines):
-        if not _is_board_header(line):
+        if not _is_header(line, table):
             continue
         end = len(lines)
         for probe in range(index + 1, len(lines)):
-            if _ends_block(lines[probe]):
+            if _ends_block(lines[probe], table):
                 end = probe
                 break
         while end > index + 1 and not lines[end - 1].strip():
@@ -99,7 +103,7 @@ def blocks(text: str) -> list[Block]:
         failure: Exception | None = None
         for candidate in range(trimmed, end + 1):
             try:
-                data = tomllib.loads("".join(lines[index:candidate]))["board"][0]
+                data = tomllib.loads("".join(lines[index:candidate]))[table][0]
             except Exception as exc:  # noqa: BLE001 - reported below with context
                 failure = failure or exc
                 continue
@@ -107,7 +111,7 @@ def blocks(text: str) -> list[Block]:
             break
         if data is None:  # malformed block: surface it with context
             raise RegistryError(
-                f"cannot parse board block at line {index + 1}: {failure}"
+                f"cannot parse {table} block at line {index + 1}: {failure}"
             ) from failure
         found.append(Block(name=_name_of(data), data=data, start=index, end=end))
     return found
@@ -123,12 +127,12 @@ def _name_of(data: Mapping[str, Any]) -> str:
     return ""
 
 
-def _find(found: list[Block], name: str) -> Block:
+def _find(found: list[Block], name: str, table: str = "board") -> Block:
     for block in found:
         if block.name == name:
             return block
     known = ", ".join(block.name for block in found) or "<none>"
-    raise RegistryError(f"no board named {name!r} (registered: {known})")
+    raise RegistryError(f"no {table} named {name!r} (registered: {known})")
 
 
 def render_value(value: Any) -> str:
@@ -164,27 +168,27 @@ def _quote(value: str) -> str:
 _KEY_ORDER = (
     "name", "logdir", "logdir_spec", "port", "enabled", "autostart", "description",
     "command", "args", "env", "cwd", "host", "reload_interval",
-    "samples_per_plugin", "idle_timeout", "start_timeout",
+    "samples_per_plugin", "idle_timeout", "start_timeout", "ssh", "label",
 )
 
 
-def render_block(entry: Mapping[str, Any]) -> str:
+def render_block(entry: Mapping[str, Any], table: str = "board") -> str:
     keys = [k for k in _KEY_ORDER if k in entry]
     keys += [k for k in entry if k not in _KEY_ORDER]
     body = "".join(f"{key} = {render_value(entry[key])}\n" for key in keys)
-    return "[[board]]\n" + body
+    return f"[[{table}]]\n" + body
 
 
-def add(text: str, entry: Mapping[str, Any]) -> str:
-    """Append a board block; the name must be free."""
+def add(text: str, entry: Mapping[str, Any], table: str = "board") -> str:
+    """Append a ``[[table]]`` block; the name must be free."""
     name = _name_of(entry)
     if not name:
         raise RegistryError("entry needs a name")
-    if any(block.name == name for block in blocks(text)):
-        raise RegistryError(f"board {name!r} already registered")
+    if any(block.name == name for block in blocks(text, table)):
+        raise RegistryError(f"{table} {name!r} already registered")
     prefix = text if text.endswith("\n") or not text else text + "\n"
     separator = "" if prefix.endswith("\n\n") or not prefix else "\n"
-    return prefix + separator + render_block(entry)
+    return prefix + separator + render_block(entry, table)
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,10 +206,10 @@ class Taken:
     remaining_digest: bytes
 
 
-def take(text: str, name: str) -> tuple[str, Taken]:
+def take(text: str, name: str, table: str = "board") -> tuple[str, Taken]:
     """Cut board ``name`` out; return the new text and what was taken."""
-    found = blocks(text)
-    block = _find(found, name)
+    found = blocks(text, table)
+    block = _find(found, name, table)
     lines = text.splitlines(keepends=True)
     end = block.end
     # Swallow the blank separator that followed the block, if any.
@@ -221,8 +225,8 @@ def take(text: str, name: str) -> tuple[str, Taken]:
     return remaining, taken
 
 
-def remove(text: str, name: str) -> str:
-    return take(text, name)[0]
+def remove(text: str, name: str, table: str = "board") -> str:
+    return take(text, name, table)[0]
 
 
 def insert(text: str, taken: Taken) -> str:
@@ -281,9 +285,9 @@ def _key_lines(lines: list[str], block: Block) -> dict[str, int]:
     return found
 
 
-def set_key(text: str, name: str, key: str, value: Any) -> str:
+def set_key(text: str, name: str, key: str, value: Any, table: str = "board") -> str:
     """Set (or insert) ``key`` inside board ``name``."""
-    block = _find(blocks(text), name)
+    block = _find(blocks(text, table), name, table)
     lines = text.splitlines(keepends=True)
     rendered = f"{key} = {render_value(value)}\n"
     index = _key_lines(lines, block).get(key)
@@ -294,8 +298,8 @@ def set_key(text: str, name: str, key: str, value: Any) -> str:
     return "".join(lines)
 
 
-def unset_key(text: str, name: str, key: str) -> str:
-    block = _find(blocks(text), name)
+def unset_key(text: str, name: str, key: str, table: str = "board") -> str:
+    block = _find(blocks(text, table), name, table)
     lines = text.splitlines(keepends=True)
     index = _key_lines(lines, block).get(key)
     if index is not None:
