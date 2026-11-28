@@ -592,6 +592,37 @@ def test_check_reports_without_disturbing_the_managers_link(machine, link_for, r
     assert remote.request(link.upstream, "GET", "/healthz")[0] == 200
 
 
+
+def _follow_until_stopped_then_break(monkeypatch):
+    """Make the stream fail the way stop() makes a real one fail: only once
+    the link is being stopped, and from under the reading thread."""
+    def follow(self):
+        self._stopping.wait()
+        raise OSError(9, "Bad file descriptor")
+
+    monkeypatch.setattr(remote.RemoteLink, "_follow", follow)
+
+
+def test_stopping_a_link_is_not_reported_as_a_failure(machine, monkeypatch):
+    _follow_until_stopped_then_break(monkeypatch)
+    states: list[str] = []
+    link: remote.RemoteLink
+    link = remote.RemoteLink(RemoteSpec(name="gpu", ssh="gpu-host"),
+                             lambda: states.append(link.to_json()["state"]),
+                             lambda: True, machine.ssh)
+    link.start()
+    wait_until(connected(link))
+    link.shutdown()
+    assert not link._thread.is_alive()
+    assert "error" not in states and link.state == "connected"
+
+
+def test_check_keeps_its_answer_while_the_link_shuts_down(machine, monkeypatch):
+    _follow_until_stopped_then_break(monkeypatch)
+    result = remote.check(RemoteSpec(name="gpu", ssh="gpu-host"), ssh=machine.ssh, timeout=30)
+    assert result["state"] == "connected" and result["error"] is None
+
+
 # ---------------------------------------------------------------- classifiers
 
 

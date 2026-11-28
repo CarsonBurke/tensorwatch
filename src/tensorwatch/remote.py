@@ -385,10 +385,13 @@ class RemoteLink:
             try:
                 self._connect()
                 self._follow()
-            except LinkError as exc:
-                self._fail(exc)
             except Exception as exc:  # never let the link thread die
-                self._fail(LinkError(FAILED, f"{type(exc).__name__}: {exc}"))
+                if self._stopping.is_set():
+                    # stop() closed the stream or ended the master under us;
+                    # that is the shutdown, not a failure worth reporting.
+                    break
+                self._fail(exc if isinstance(exc, LinkError)
+                           else LinkError(FAILED, f"{type(exc).__name__}: {exc}"))
 
     def _sleep(self, seconds: float) -> None:
         self._wake.wait(max(0.05, seconds))
@@ -818,6 +821,8 @@ def check(spec: RemoteSpec, ssh: str | None = None, timeout: float = 120.0) -> d
     link: RemoteLink
 
     def publish() -> None:
+        if done.is_set():
+            return  # the first outcome is the answer; shutting down follows it
         state = link.to_json()
         if state["state"] in ("connected", "error"):
             seen.update(state)
